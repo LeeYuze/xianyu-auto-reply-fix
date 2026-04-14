@@ -200,8 +200,18 @@ def build_face_verify_notification(
     )
 
     if has_screenshot:
-        verification_action = '请在自动化网站的账号管理弹窗中扫描二维码完成验证:'
-        verification_target = '自动化网站账号管理弹窗中的验证二维码'
+        if verification_type_label == '短信验证':
+            verification_action = '请在自动化网站的账号管理弹窗中完成短信验证:'
+            verification_target = '自动化网站账号管理弹窗中的短信验证界面'
+        elif verification_type_label == '二维码验证':
+            verification_action = '请在自动化网站的账号管理弹窗中扫码完成验证:'
+            verification_target = '自动化网站账号管理弹窗中的验证二维码'
+        elif verification_type_label == '人脸验证':
+            verification_action = '请在自动化网站的账号管理弹窗中完成人脸验证:'
+            verification_target = '自动化网站账号管理弹窗中的人脸验证界面'
+        else:
+            verification_action = '请在自动化网站的账号管理弹窗中完成验证:'
+            verification_target = '自动化网站账号管理弹窗中的验证界面'
     else:
         verification_action = '请点击验证链接完成验证:'
         verification_target = verification_url or '无'

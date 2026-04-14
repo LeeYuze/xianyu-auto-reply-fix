@@ -30,6 +30,7 @@ from collections import defaultdict, deque
 from typing import Any, Dict, Optional, Tuple
 from db_manager import db_manager
 from utils.notification_dispatcher import (
+    build_face_verify_notification,
     dispatch_account_notifications,
     format_notification_template,
     get_notification_template_text,
@@ -644,12 +645,78 @@ class XianyuLive:
             'created_at': time.time(),
         }
 
+    def _get_active_password_login_failure_backoff(self, current_time: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """获取仍在生效的密码登录失败退避状态，并处理可忽略的旧滑块退避。"""
+        current_time = current_time or time.time()
+        failure_backoff = XianyuLive.get_password_login_failure_backoff(self.cookie_id)
+        if not failure_backoff:
+            return None
+
+        remaining_time = failure_backoff.get('until', 0) - current_time
+        if remaining_time <= 0:
+            return None
+
+        backoff_reason = failure_backoff.get('reason', 'unknown')
+        if backoff_reason == 'slider_failed' and (
+            self._has_recent_slider_success() or self.consume_manual_refresh_slider_failed_bypass(self.cookie_id)
+        ):
+            logger.warning(
+                f"【{self.cookie_id}】检测到最近刚通过滑块或处于刷新交接恢复窗口，忽略一次旧的 slider_failed 退避并继续尝试恢复"
+            )
+            XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
+            return None
+
+        state = dict(failure_backoff)
+        state['reason'] = backoff_reason
+        state['remaining_time'] = remaining_time
+        return state
+
+    def _should_skip_token_refresh_for_login_backoff(self, current_time: Optional[float] = None) -> bool:
+        """在需要人工介入或明确退避期间，直接跳过 token 预检，避免重复打到平台。"""
+        current_time = current_time or time.time()
+        failure_backoff = self._get_active_password_login_failure_backoff(current_time)
+        if not failure_backoff:
+            return False
+
+        backoff_reason = failure_backoff.get('reason', 'unknown')
+        if backoff_reason not in {'slider_failed', 'verification_required', 'credentials', 'risk_control'}:
+            return False
+
+        remaining_time = failure_backoff.get('remaining_time', 0.0)
+        should_log = (
+            self.last_token_refresh_status != "password_login_backoff_wait" or
+            (current_time - getattr(self, 'last_password_login_backoff_log_time', 0.0)) >= 30
+        )
+        if should_log:
+            logger.warning(
+                f"【{self.cookie_id}】密码登录失败退避中（原因: {backoff_reason}），"
+                f"直接跳过本次token刷新，还需等待 {remaining_time:.1f} 秒"
+            )
+            self.last_password_login_backoff_log_time = current_time
+
+        self.last_token_refresh_status = "password_login_backoff_wait"
+        self.last_token_refresh_error_message = f"密码登录失败退避中，剩余{remaining_time:.1f}秒"
+        return True
+
     @staticmethod
     def classify_password_login_failure(error_message: str) -> Tuple[str, int]:
         """按失败类型返回(原因标签, 退避秒数)"""
         message = (error_message or "").lower()
         if any(keyword in message for keyword in ["账号密码错误", "账密错误", "用户名或密码错误", "密码错误"]):
             return "credentials", 1800
+        if any(
+            keyword in message for keyword in [
+                "短信验证",
+                "二维码验证",
+                "人脸验证",
+                "身份验证",
+                "等待短信验证超时",
+                "等待二维码验证超时",
+                "等待人脸验证超时",
+                "等待身份验证超时",
+            ]
+        ):
+            return "verification_required", 900
         if any(keyword in message for keyword in ["前置滑块", "风控", "拦截", "框体错误", "点击框体重试", "账号存在风险", "闲鱼客户端登录"]):
             return "risk_control", 900
         if any(keyword in message for keyword in ["滑块验证失败", "未找到滑块容器"]):
@@ -1659,6 +1726,7 @@ class XianyuLive:
         self.last_slider_success_cookie_length = 0
         self.slider_success_reentry_window = 30
         self.post_slider_token_retry_delay = (1.5, 3.0)
+        self.last_password_login_backoff_log_time = 0.0
         self.token_refresh_lock = asyncio.Lock()  # 防止多个入口并发刷新 token
 
         # WebSocket连接监控
@@ -5651,6 +5719,9 @@ class XianyuLive:
                 self.last_token_refresh_status = "skipped_cooldown"
                 return None
 
+            if self._should_skip_token_refresh_for_login_backoff(current_time):
+                return None
+
             # 【重要】在刷新token前，先从数据库重新加载最新的cookie
             # 这样即使用户已经手动更新了cookie，代码也会使用最新的cookie
             logger.info(f"【{self.cookie_id}】开始执行Cookie刷新任务...")
@@ -5954,6 +6025,9 @@ class XianyuLive:
                                 )
                             else:
                                 logger.error(f"【{self.cookie_id}】滑块验证失败")
+                                XianyuLive.set_password_login_failure_backoff(self.cookie_id, 'slider_failed', 600)
+                                self.last_token_refresh_error_message = "滑块验证失败，未获取到新Cookie"
+                                logger.warning(f"【{self.cookie_id}】已进入滑块失败退避期: slider_failed, 600秒")
 
                                 # 更新风控日志为失败状态
                                 if 'log_id' in locals() and log_id:
@@ -5978,6 +6052,9 @@ class XianyuLive:
                         except Exception as captcha_e:
                             logger.error(f"【{self.cookie_id}】滑块验证处理异常: {self._safe_str(captcha_e)}")
                             self._clear_pending_slider_success_notice("滑块验证处理异常")
+                            XianyuLive.set_password_login_failure_backoff(self.cookie_id, 'slider_failed', 600)
+                            self.last_token_refresh_error_message = self._safe_str(captcha_e)
+                            logger.warning(f"【{self.cookie_id}】滑块验证异常后进入退避期: slider_failed, 600秒")
 
                             # 更新风控日志为异常状态
                             captcha_duration = time.time() - captcha_start_time if 'captcha_start_time' in locals() else 0
@@ -6698,38 +6775,35 @@ class XianyuLive:
 
         # 检查是否在密码登录冷却期内，避免重复登录
         current_time = time.time()
-        failure_backoff = XianyuLive.get_password_login_failure_backoff(self.cookie_id)
+        failure_backoff = self._get_active_password_login_failure_backoff(current_time)
         if failure_backoff:
-            remaining_time = failure_backoff.get('until', 0) - current_time
-            if remaining_time > 0:
-                backoff_reason = failure_backoff.get('reason', 'unknown')
-                if backoff_reason == 'slider_failed' and (
-                    ignore_slider_failed_backoff or self.consume_manual_refresh_slider_failed_bypass(self.cookie_id)
-                ):
-                    logger.warning(
-                        f"【{self.cookie_id}】检测到最近刚通过滑块或处于刷新交接恢复窗口，忽略一次旧的 slider_failed 退避并继续尝试密码登录刷新"
-                    )
-                    XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
-                    failure_backoff = None
-                else:
-                    logger.warning(
-                        f"【{self.cookie_id}】密码登录失败退避中（原因: {backoff_reason}），还需等待 {remaining_time:.1f} 秒"
-                    )
-                    if refresh_risk_log_id:
-                        self._update_risk_log(
-                            refresh_risk_log_id,
-                            session_id=risk_session_id,
+            backoff_reason = failure_backoff.get('reason', 'unknown')
+            remaining_time = failure_backoff.get('remaining_time', 0.0)
+            if backoff_reason == 'slider_failed' and ignore_slider_failed_backoff:
+                logger.warning(
+                    f"【{self.cookie_id}】检测到最近刚通过滑块，忽略一次旧的 slider_failed 退避并继续尝试密码登录刷新"
+                )
+                XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
+                failure_backoff = None
+            else:
+                logger.warning(
+                    f"【{self.cookie_id}】密码登录失败退避中（原因: {backoff_reason}），还需等待 {remaining_time:.1f} 秒"
+                )
+                if refresh_risk_log_id:
+                    self._update_risk_log(
+                        refresh_risk_log_id,
+                        session_id=risk_session_id,
+                        trigger_scene=trigger_scene,
+                        result_code='password_login_backoff',
+                        processing_status='failed',
+                        error_message=f"密码登录失败退避中，剩余{remaining_time:.1f}秒",
+                        duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                        event_meta=self._build_risk_event_meta(
                             trigger_scene=trigger_scene,
-                            result_code='password_login_backoff',
-                            processing_status='failed',
-                            error_message=f"密码登录失败退避中，剩余{remaining_time:.1f}秒",
-                            duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                            event_meta=self._build_risk_event_meta(
-                                trigger_scene=trigger_scene,
-                                extra={**base_event_meta, 'backoff_reason': backoff_reason, 'backoff_seconds': failure_backoff.get('seconds')},
-                            ),
-                        )
-                    return False
+                            extra={**base_event_meta, 'backoff_reason': backoff_reason, 'backoff_seconds': failure_backoff.get('seconds')},
+                        ),
+                    )
+                return False
 
         last_password_login = XianyuLive._last_password_login_time.get(self.cookie_id, 0)
         time_since_last_login = current_time - last_password_login
@@ -6850,14 +6924,20 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】使用账号: {username}")
             
             # 创建一个通知回调包装函数，支持接收截图路径和验证链接
-            async def notification_callback_wrapper(message: str, screenshot_path: str = None, verification_url: str = None):
+            async def notification_callback_wrapper(
+                message: str,
+                screenshot_path: str = None,
+                verification_url: str = None,
+                verification_type: str = None,
+            ):
                 """通知回调包装函数，支持接收截图路径和验证链接"""
                 await self.send_token_refresh_notification(
                     error_message=message,
                     notification_type="token_refresh",
                     chat_id=None,
                     attachment_path=screenshot_path,
-                    verification_url=verification_url
+                    verification_url=verification_url,
+                    verification_type=verification_type,
                 )
             
             # 在单独的线程中运行同步的登录方法
@@ -9055,7 +9135,15 @@ class XianyuLive:
             logger.error(f"发送Telegram通知异常: {self._safe_str(e)}")
             return False
 
-    async def send_token_refresh_notification(self, error_message: str, notification_type: str = "token_refresh", chat_id: str = None, attachment_path: str = None, verification_url: str = None):
+    async def send_token_refresh_notification(
+        self,
+        error_message: str,
+        notification_type: str = "token_refresh",
+        chat_id: str = None,
+        attachment_path: str = None,
+        verification_url: str = None,
+        verification_type: str = None,
+    ):
         """发送Token刷新异常通知（带防重复机制，支持附件）
         
         Args:
@@ -9063,6 +9151,7 @@ class XianyuLive:
             notification_type: 通知类型
             chat_id: 聊天ID（可选）
             attachment_path: 附件路径（可选，用于发送截图）
+            verification_type: 验证类型（可选，优先使用调用方已识别的真实类型）
         """
         try:
             # 检查是否是正常的令牌过期，这种情况不需要发送通知
@@ -9135,12 +9224,13 @@ class XianyuLive:
                     cookie_count='已获取'
                 )
             elif "人脸验证" in error_message or "短信验证" in error_message or "二维码验证" in error_message or "身份验证" in error_message or (verification_url and "passport" in verification_url):
-                notification_msg = render_notification_template(
-                    'face_verify',
+                notification_msg = build_face_verify_notification(
                     account_id=self.cookie_id,
-                    time=time.strftime('%Y-%m-%d %H:%M:%S'),
-                    verification_url=verification_url or '无',
-                    verification_type=guess_verification_type(error_message, verification_url)
+                    time_text=time.strftime('%Y-%m-%d %H:%M:%S'),
+                    verification_type=verification_type or guess_verification_type(error_message, verification_url),
+                    verification_url=verification_url or '',
+                    error_message=error_message,
+                    has_screenshot=bool(attachment_path),
                 )
             elif verification_url:
                 notification_msg = render_notification_template(
