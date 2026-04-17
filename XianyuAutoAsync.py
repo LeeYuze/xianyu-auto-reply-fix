@@ -39,6 +39,13 @@ from utils.notification_dispatcher import (
 )
 
 
+MANUAL_VERIFICATION_CONTEXTS = {
+    'manual_password_login',
+    'manual_cookie_refresh',
+    'manual_refresh',
+}
+
+
 DELIVERY_BATCH_MAX_UNITS = 10
 DELIVERY_BATCH_MAX_CHARS = 1200
 PROTECTED_SESSION_COOKIE_FIELDS = (
@@ -486,6 +493,15 @@ class XianyuLive:
         return True, None
 
     @classmethod
+    def get_auth_recovery_lock_state(cls, cookie_id: str) -> Optional[Dict[str, Any]]:
+        if not cookie_id:
+            return None
+        cls._cleanup_auth_recovery_locks()
+        with cls._auth_recovery_lock:
+            state = cls._auth_recovery_locks.get(cookie_id)
+            return dict(state) if state else None
+
+    @classmethod
     def release_auth_recovery_lock(cls, cookie_id: str, owner: str = None):
         if not cookie_id:
             return
@@ -744,41 +760,112 @@ class XianyuLive:
             return False
         return "账号存在风险" in message and ("闲鱼客户端登录" in message or "按提示操作" in message)
 
+    @staticmethod
+    def _is_account_pause_status(status: str) -> bool:
+        return status in {"account_risk_protected", "manual_verification_required"}
+
+    async def _apply_account_pause_state(
+        self,
+        *,
+        refresh_status: str,
+        status_note: str,
+        error_message: str,
+        connection_message: str,
+        note_error_prefix: str,
+        status_error_prefix: str,
+        memory_error_prefix: str,
+    ) -> None:
+        self.current_token = None
+        self.last_token_refresh_status = refresh_status
+        self.last_token_refresh_error_message = str(error_message or "").strip()
+        XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
+
+        try:
+            db_manager.update_cookie_status_note(self.cookie_id, status_note)
+        except Exception as note_e:
+            logger.error(f"【{self.cookie_id}】{note_error_prefix}: {self._safe_str(note_e)}")
+
+        try:
+            db_manager.save_cookie_status(self.cookie_id, False)
+        except Exception as status_e:
+            logger.error(f"【{self.cookie_id}】{status_error_prefix}: {self._safe_str(status_e)}")
+
+        try:
+            from cookie_manager import manager as cookie_manager_manager
+            if cookie_manager_manager:
+                cookie_manager_manager.cookie_status[self.cookie_id] = False
+        except Exception as cm_e:
+            logger.error(f"【{self.cookie_id}】{memory_error_prefix}: {self._safe_str(cm_e)}")
+
+        self._set_connection_state(ConnectionState.FAILED, connection_message)
+
+    async def _clear_account_pause_state(self, reason: str = "认证恢复成功") -> None:
+        self.last_token_refresh_error_message = ""
+
+        try:
+            db_manager.update_cookie_status_note(self.cookie_id, '')
+        except Exception as note_e:
+            logger.error(f"【{self.cookie_id}】清理账号状态文案失败: {self._safe_str(note_e)}")
+
+        try:
+            db_manager.save_cookie_status(self.cookie_id, True)
+        except Exception as status_e:
+            logger.error(f"【{self.cookie_id}】恢复账号启用状态失败: {self._safe_str(status_e)}")
+
+        try:
+            from cookie_manager import manager as cookie_manager_manager
+            if cookie_manager_manager:
+                cookie_manager_manager.cookie_status[self.cookie_id] = True
+        except Exception as cm_e:
+            logger.error(f"【{self.cookie_id}】恢复内存账号状态失败: {self._safe_str(cm_e)}")
+
+        logger.info(f"【{self.cookie_id}】账号暂停状态已清理: {reason}")
+
+    async def _request_stop_after_account_pause(self, reason: str) -> None:
+        try:
+            from cookie_manager import manager as cookie_manager_manager
+            if not cookie_manager_manager:
+                return
+
+            current_task = asyncio.current_task()
+            tracked_task = cookie_manager_manager.tasks.get(self.cookie_id)
+
+            if tracked_task is current_task:
+                cookie_manager_manager.tasks.pop(self.cookie_id, None)
+                loop = asyncio.get_running_loop()
+
+                def _cancel_current_task() -> None:
+                    if current_task and not current_task.done():
+                        current_task.cancel()
+
+                loop.call_soon(_cancel_current_task)
+                logger.info(f"【{self.cookie_id}】账号已暂停，当前任务将在本轮流程结束后停止: {reason}")
+                return
+
+            if tracked_task and not tracked_task.done():
+                tracked_task.cancel()
+                logger.info(f"【{self.cookie_id}】账号已暂停，已取消运行中的账号任务: {reason}")
+
+            if tracked_task is not None:
+                cookie_manager_manager.tasks.pop(self.cookie_id, None)
+        except Exception as stop_e:
+            logger.warning(f"【{self.cookie_id}】请求停止暂停账号任务失败: {self._safe_str(stop_e)}")
+
     async def _protect_account_from_risk_login_retry(self, error_message: str, status_note: str = "风控保护中") -> bool:
         """命中高风险登录提示后自动禁用账号，避免持续触发更强风控。"""
         message = str(error_message or "").strip()
         if not self._is_account_risk_login_error(message):
             return False
 
-        self.current_token = None
-        self.last_token_refresh_status = "account_risk_protected"
-        self.last_token_refresh_error_message = message
-        XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
-
-        try:
-            db_manager.update_cookie_status_note(self.cookie_id, status_note)
-        except Exception as note_e:
-            logger.error(f"【{self.cookie_id}】写入账号状态文案失败: {self._safe_str(note_e)}")
-
-        try:
-            db_manager.save_cookie_status(self.cookie_id, False)
-        except Exception as status_e:
-            logger.error(f"【{self.cookie_id}】持久化账号禁用状态失败: {self._safe_str(status_e)}")
-
-        try:
-            from cookie_manager import manager as cookie_manager_manager
-            if cookie_manager_manager:
-                cookie_manager_manager.cookie_status[self.cookie_id] = False
-                tracked_task = cookie_manager_manager.tasks.get(self.cookie_id)
-                current_task = asyncio.current_task()
-                if tracked_task is current_task:
-                    cookie_manager_manager.tasks.pop(self.cookie_id, None)
-                elif tracked_task and tracked_task.done():
-                    cookie_manager_manager.tasks.pop(self.cookie_id, None)
-        except Exception as cm_e:
-            logger.error(f"【{self.cookie_id}】更新内存账号状态失败: {self._safe_str(cm_e)}")
-
-        self._set_connection_state(ConnectionState.FAILED, "检测到账号风控，已自动禁用")
+        await self._apply_account_pause_state(
+            refresh_status="account_risk_protected",
+            status_note=status_note,
+            error_message=message,
+            connection_message="检测到账号风控，已自动禁用",
+            note_error_prefix="写入账号状态文案失败",
+            status_error_prefix="持久化账号禁用状态失败",
+            memory_error_prefix="更新内存账号状态失败",
+        )
         logger.error(
             f"【{self.cookie_id}】检测到账号高风险登录提示，已自动禁用账号并标记为“{status_note}”，停止后续自动登录重试"
         )
@@ -787,6 +874,85 @@ class XianyuLive:
         except Exception as reconnect_e:
             logger.warning(f"【{self.cookie_id}】风控保护触发后关闭WebSocket失败: {self._safe_str(reconnect_e)}")
         return True
+
+    async def _pause_account_for_manual_verification(
+        self,
+        verification_type: str = None,
+        error_message: str = "",
+        pause_account: bool = True,
+        verification_context: str = 'auto_refresh',
+        verification_url: str = '',
+    ) -> bool:
+        """检测到需要人工验证时，按上下文决定是否暂停账号。"""
+        verification_type_names = {
+            'face_verify': '人脸验证',
+            'sms_verify': '短信验证',
+            'qr_verify': '二维码验证',
+            'unknown': '身份验证',
+        }
+        type_name = verification_type_names.get(verification_type, '身份验证')
+        status_note = f"待{type_name}"
+        message = str(error_message or f"检测到需要人工完成的{type_name}").strip()
+
+        if not pause_account:
+            logger.warning(
+                f"【{self.cookie_id}】检测到需要人工完成的{type_name}，但当前属于手动流程({verification_context})，不自动暂停账号"
+            )
+            return False
+
+        await self._apply_account_pause_state(
+            refresh_status="manual_verification_required",
+            status_note=status_note,
+            error_message=message,
+            connection_message=f"检测到{type_name}，已自动暂停账号",
+            note_error_prefix="写入人工验证状态文案失败",
+            status_error_prefix="持久化人工验证暂停状态失败",
+            memory_error_prefix="更新人工验证内存状态失败",
+        )
+        logger.warning(
+            f"【{self.cookie_id}】检测到需要人工完成的{type_name}，已自动暂停账号并标记为“{status_note}”"
+        )
+        await self.send_account_paused_notification(
+            status_note=status_note,
+            pause_reason=type_name,
+            error_message=message,
+            verification_url=verification_url,
+            action_hint='请先完成验证，再在账号管理中恢复或重新启动该账号。',
+        )
+        return True
+
+    async def send_account_paused_notification(
+        self,
+        *,
+        status_note: str,
+        pause_reason: str,
+        error_message: str,
+        verification_url: str = '',
+        action_hint: str = '',
+    ) -> bool:
+        message = render_notification_template(
+            'account_paused',
+            account_id=self.cookie_id,
+            status_note=status_note or '已暂停',
+            pause_reason=pause_reason or '未知原因',
+            time=time.strftime('%Y-%m-%d %H:%M:%S'),
+            error_message=error_message or '系统检测到账号需要人工处理',
+            verification_url=verification_url or '无',
+            action_hint=action_hint or '请尽快处理账号状态，避免自动任务长时间不可用。',
+        )
+
+        logger.info(f"【{self.cookie_id}】准备发送账号暂停通知")
+        sent = await dispatch_account_notifications(
+            self.cookie_id,
+            message,
+            title='闲鱼账号已暂停',
+            notification_type='account_paused',
+        )
+        if sent:
+            logger.info(f"【{self.cookie_id}】账号暂停通知发送成功")
+        else:
+            logger.warning(f"【{self.cookie_id}】账号暂停通知未发送成功")
+        return sent
     
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
@@ -1939,6 +2105,52 @@ class XianyuLive:
 
         logger.info(f"【{cookie_id}】结束手动刷新保护期，来源: {source}")
         return True
+
+    @classmethod
+    def begin_auth_recovery_session(
+        cls,
+        cookie_id: str,
+        owner: str,
+        *,
+        mode: str,
+        source: str,
+        ttl: int = None,
+        force_replace: bool = False,
+    ) -> Dict[str, Any]:
+        if not cookie_id or not owner:
+            return {'started': False, 'reason': 'empty_cookie_id_or_owner'}
+
+        acquired, existing = cls.acquire_auth_recovery_lock(cookie_id, owner, ttl=ttl)
+        if not acquired:
+            existing_owner = (existing or {}).get('owner', 'unknown')
+            if not force_replace:
+                return {
+                    'started': False,
+                    'already_active': True,
+                    'active_owner': existing_owner,
+                    'reason': 'auth_recovery_in_progress',
+                }
+            cls.release_auth_recovery_lock(cookie_id, existing_owner)
+            acquired, existing = cls.acquire_auth_recovery_lock(cookie_id, owner, ttl=ttl)
+            if not acquired:
+                return {
+                    'started': False,
+                    'already_active': True,
+                    'active_owner': (existing or {}).get('owner', 'unknown'),
+                    'reason': 'auth_recovery_replace_failed',
+                }
+
+        return {
+            'started': True,
+            'already_active': False,
+            'owner': owner,
+            'mode': mode,
+            'source': source,
+        }
+
+    @classmethod
+    def end_auth_recovery_session(cls, cookie_id: str, owner: str) -> None:
+        cls.release_auth_recovery_lock(cookie_id, owner)
     
     def _create_tracked_task(self, coro):
         """创建并追踪后台任务，确保异常不会被静默忽略"""
@@ -6221,7 +6433,7 @@ class XianyuLive:
                                 )
                             
                             if not refresh_success:
-                                if allow_password_login_recovery and self.last_token_refresh_status != "account_risk_protected":
+                                if allow_password_login_recovery and not self._is_account_pause_status(self.last_token_refresh_status):
                                     self.last_token_refresh_status = "token_expired_recovery_failed"
                                 self._clear_pending_slider_success_notice("恢复流程失败")
                                 # 标记已发送通知，避免重复通知
@@ -6931,6 +7143,47 @@ class XianyuLive:
                 verification_type: str = None,
             ):
                 """通知回调包装函数，支持接收截图路径和验证链接"""
+                verification_context = 'manual_cookie_refresh' if self.is_manual_refresh_active(self.cookie_id, allow_handoff_recovery=True) else 'auto_refresh'
+                should_pause_account = verification_context not in MANUAL_VERIFICATION_CONTEXTS
+                self.last_token_refresh_status = 'verification_pending_manual' if not should_pause_account else 'manual_verification_required'
+                self.last_token_refresh_error_message = str(message or '').strip()
+                pause_target_loop = None
+                try:
+                    from cookie_manager import manager as cookie_manager_manager
+                    pause_target_loop = getattr(cookie_manager_manager, 'loop', None)
+                except Exception:
+                    pause_target_loop = None
+
+                current_loop = None
+                try:
+                    current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    current_loop = None
+
+                if pause_target_loop and pause_target_loop.is_running() and pause_target_loop is not current_loop:
+                    pause_future = asyncio.run_coroutine_threadsafe(
+                        self._pause_account_for_manual_verification(
+                            verification_type=verification_type,
+                            error_message=message,
+                            pause_account=should_pause_account,
+                            verification_context=verification_context,
+                            verification_url=verification_url or '',
+                        ),
+                        pause_target_loop,
+                    )
+                    try:
+                        pause_future.result(timeout=10)
+                    except Exception as pause_e:
+                        logger.warning(f"【{self.cookie_id}】跨线程暂停人工验证账号失败: {self._safe_str(pause_e)}")
+                else:
+                    await self._pause_account_for_manual_verification(
+                        verification_type=verification_type,
+                        error_message=message,
+                        pause_account=should_pause_account,
+                        verification_context=verification_context,
+                        verification_url=verification_url or '',
+                    )
+
                 await self.send_token_refresh_notification(
                     error_message=message,
                     notification_type="token_refresh",
@@ -6939,6 +7192,10 @@ class XianyuLive:
                     verification_url=verification_url,
                     verification_type=verification_type,
                 )
+                if should_pause_account:
+                    await self._request_stop_after_account_pause(
+                        f"检测到需要人工完成的{verification_type or 'manual_verification'}"
+                    )
             
             # 在单独的线程中运行同步的登录方法
             import asyncio
@@ -6987,6 +7244,9 @@ class XianyuLive:
                 # 记录密码登录时间，防止重复登录
                 XianyuLive._last_password_login_time[self.cookie_id] = time.time()
                 logger.warning(f"【{self.cookie_id}】已记录密码登录时间，冷却期 {XianyuLive._password_login_cooldown} 秒")
+                await self._clear_account_pause_state("密码登录刷新成功")
+                self.last_token_refresh_status = 'cookie_refresh_success'
+                self.last_token_refresh_error_message = ''
                 
                 # ⚠️ 先发送通知，再更新cookies并重启任务
                 # 因为重启后当前任务会被取消，不能在重启后发送通知
@@ -7049,6 +7309,7 @@ class XianyuLive:
                                 extra={**base_event_meta, 'status_note': '风控保护中'},
                             ),
                         )
+                    await self._request_stop_after_account_pause("检测到账号高风险登录提示")
                     return False
                 backoff_reason, backoff_seconds = XianyuLive.classify_password_login_failure(login_error)
                 XianyuLive.set_password_login_failure_backoff(self.cookie_id, backoff_reason, backoff_seconds)
@@ -7086,6 +7347,7 @@ class XianyuLive:
                             extra={**base_event_meta, 'status_note': '风控保护中'},
                         ),
                     )
+                await self._request_stop_after_account_pause("检测到账号高风险登录异常")
                 return False
             self.last_token_refresh_error_message = self._safe_str(refresh_e)
             backoff_reason, backoff_seconds = XianyuLive.classify_password_login_failure(str(refresh_e))
@@ -9364,6 +9626,9 @@ class XianyuLive:
         if last_refresh_status == "account_risk_protected":
             return "检测到账号风控，系统已停止自动登录重试，请前往闲鱼APP处理后再手动启用账号"
 
+        if last_refresh_status == "manual_verification_required":
+            return "检测到需要人工验证，系统已自动暂停账号，请完成验证后再手动启用账号"
+
         if last_refresh_status in {"session_expired_after_slider", "session_expired_preflight"}:
             return "Session已过期，系统自动恢复失败，请重新登录"
 
@@ -11335,6 +11600,7 @@ class XianyuLive:
 
     async def list_all_conversations(self, cid: str, page_size: int = 20):
         """拉取指定会话的历史消息。"""
+        logger.info(f"【{self.cookie_id}】开始通过独立临时连接拉取历史消息: chat_id={cid}, page_size={page_size}")
         headers = self._build_websocket_headers()
         async with await self._create_websocket_connection(headers) as websocket:
             await self.init(websocket)
@@ -11353,8 +11619,26 @@ class XianyuLive:
                 ]
             }
             history_messages = []
+            response_timeout = 10
 
-            async for raw_message in websocket:
+            await websocket.send(json.dumps(request_msg))
+
+            while True:
+                try:
+                    raw_message = await asyncio.wait_for(websocket.recv(), timeout=response_timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"【{self.cookie_id}】历史消息拉取等待响应超时: chat_id={cid}, "
+                        f"fetched={len(history_messages)}, timeout={response_timeout}s"
+                    )
+                    return history_messages
+                except Exception as recv_exc:
+                    logger.warning(
+                        f"【{self.cookie_id}】历史消息连接提前结束: chat_id={cid}, "
+                        f"fetched={len(history_messages)}, error={self._safe_str(recv_exc)}"
+                    )
+                    return history_messages
+
                 try:
                     message = json.loads(raw_message)
                 except Exception:
@@ -11377,10 +11661,9 @@ class XianyuLive:
                     await websocket.send(json.dumps(ack))
                 except Exception:
                     pass
-
+                
                 try:
                     if message.get('lwp') == "/s/vulcan":
-                        await websocket.send(json.dumps(request_msg))
                         continue
 
                     recv_mid = message.get("headers", {}).get("mid", "")
@@ -11401,10 +11684,26 @@ class XianyuLive:
                             except Exception:
                                 parsed_message = {"raw": send_message_base64}
 
+                        created_at = None
+                        for candidate in (
+                            user_message.get("createTime"),
+                            user_message.get("gmtCreate"),
+                            user_message.get("createdAt"),
+                            user_message.get("messageTime"),
+                            user_message.get("sendTime"),
+                            user_message.get("timestamp"),
+                            extension.get("createTime") if isinstance(extension, dict) else None,
+                        ):
+                            if candidate not in (None, "", 0, "0"):
+                                created_at = candidate
+                                break
+
                         history_messages.insert(0, {
                             "send_user_id": extension.get("senderUserId", ""),
-                            "send_user_name": extension.get("reminderTitle", ""),
+                            "send_user_name": extension.get("senderNick") or extension.get("reminderTitle", ""),
                             "message": parsed_message,
+                            "message_extension": extension,
+                            "created_at": created_at,
                         })
 
                     if has_more:
@@ -11413,12 +11712,71 @@ class XianyuLive:
                         request_msg["body"][2] = next_cursor
                         await websocket.send(json.dumps(request_msg))
                     else:
+                        logger.info(f"【{self.cookie_id}】历史消息拉取完成: chat_id={cid}, fetched={len(history_messages)}")
                         return history_messages
                 except Exception as e:
                     logger.warning(f"【{self.cookie_id}】拉取历史消息时发生异常: {self._safe_str(e)}")
                     return history_messages
 
         return []
+
+    async def fetch_conversation_history_once(self, cid: str, page_size: int = 20):
+        """使用独立临时实例拉取历史消息，避免影响主连接状态。"""
+        isolated_live = XianyuLive(
+            cookies_str=self.cookies_str,
+            cookie_id=self.cookie_id,
+            user_id=self.user_id,
+            register_instance=False,
+        )
+        isolated_live.current_token = self.current_token
+        isolated_live.last_token_refresh_time = self.last_token_refresh_time
+        isolated_live.proxy_config = dict(self.proxy_config or {})
+        isolated_live.base_url = self.base_url
+        logger.info(f"【{self.cookie_id}】已创建独立历史拉取实例: chat_id={cid}, page_size={page_size}")
+        return await isolated_live.list_all_conversations(cid, page_size=page_size)
+
+    async def fetch_conversation_history_with_fallback(self, cid: str, page_size: int = 20, isolated_timeout: int = 12):
+        """优先使用独立临时实例拉取历史，超时后回退到主实例方式。"""
+        try:
+            return await asyncio.wait_for(
+                self.fetch_conversation_history_once(cid, page_size=page_size),
+                timeout=max(3, isolated_timeout),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"【{self.cookie_id}】独立历史拉取超时，回退主实例方式: chat_id={cid}, "
+                f"page_size={page_size}, timeout={isolated_timeout}s"
+            )
+        except Exception as isolated_exc:
+            logger.warning(
+                f"【{self.cookie_id}】独立历史拉取失败，回退主实例方式: chat_id={cid}, "
+                f"error={self._safe_str(isolated_exc)}"
+            )
+
+        return await self.list_all_conversations(cid, page_size=page_size)
+
+    def _extract_image_url_from_message(self, message: dict) -> Optional[str]:
+        """从消息结构中提取图片URL"""
+        try:
+            message_1 = message.get('1', {})
+            if not isinstance(message_1, dict):
+                return None
+            message_6 = message_1.get('6', {})
+            if not isinstance(message_6, dict):
+                return None
+            message_6_3 = message_6.get('3', {})
+            if not isinstance(message_6_3, dict):
+                return None
+            content_json_str = message_6_3.get('5', '')
+            if content_json_str:
+                import json as _json
+                content_obj = _json.loads(content_json_str)
+                pics = content_obj.get('image', {}).get('pics', [])
+                if pics:
+                    return pics[0].get('url', '')
+        except Exception:
+            pass
+        return None
 
     async def send_heartbeat(self, ws):
         """发送心跳包"""
@@ -11985,7 +12343,10 @@ class XianyuLive:
                 await page.reload(wait_until='domcontentloaded', timeout=12000)
                 logger.info(f"【{target_cookie_id}】页面刷新成功")
             except Exception as e:
-                if 'timeout' in str(e).lower():
+                error_text = str(e).lower()
+                if 'net::err_aborted' in error_text or 'frame was detached' in error_text:
+                    logger.warning(f"【{target_cookie_id}】页面刷新被中断，继续直接读取当前上下文Cookie: {self._safe_str(e)}")
+                elif 'timeout' in error_text:
                     logger.warning(f"【{target_cookie_id}】页面刷新超时，使用降级策略...")
                     await page.reload(wait_until='load', timeout=15000)
                     logger.info(f"【{target_cookie_id}】页面刷新成功（降级策略）")
@@ -13276,6 +13637,122 @@ class XianyuLive:
             await self.session.close()
             self.session = None
 
+    def _get_mtop_token(self) -> str:
+        token_value = trans_cookies(self.cookies_str).get('_m_h5_tk', '')
+        return token_value.split('_')[0] if token_value else ''
+
+    async def _post_mtop_api(self, api_name: str, version: str, data: Dict[str, Any], *,
+                             data_type: str = 'json', response_content_type: str = None,
+                             extra_params: Dict[str, Any] = None, source: str = 'mtop_api') -> Dict[str, Any]:
+        """发送通用的闲鱼 mtop POST 请求。"""
+        if not self.session:
+            await self.create_session()
+
+        self._reload_latest_cookies_from_db(f"{api_name}调用前")
+
+        timestamp = str(int(time.time() * 1000))
+        data_val = json.dumps(data, separators=(',', ':'))
+        token = self._get_mtop_token()
+
+        params = {
+            'jsv': '2.7.2',
+            'appKey': '34839810',
+            't': timestamp,
+            'sign': generate_sign(timestamp, token, data_val),
+            'v': version,
+            'type': 'originaljson' if data_type == 'json' else data_type,
+            'accountSite': 'xianyu',
+            'dataType': 'json',
+            'timeout': '20000',
+            'api': api_name,
+            'sessionOption': 'AutoLoginOnly',
+            'spm_cnt': 'a21ybx.im.0.0',
+        }
+        if extra_params:
+            params.update({k: v for k, v in extra_params.items() if v is not None})
+
+        headers = DEFAULT_HEADERS.copy()
+        headers['content-type'] = 'application/x-www-form-urlencoded'
+        headers['cookie'] = self.cookies_str
+
+        request_kwargs = {}
+        if getattr(self, '_http_proxy_url', None):
+            request_kwargs['proxy'] = self._http_proxy_url
+
+        api_url = f'https://h5api.m.goofish.com/h5/{api_name}/{version}/'
+        async with self.session.post(
+            api_url,
+            params=params,
+            data={'data': data_val},
+            headers=headers,
+            **request_kwargs,
+        ) as response:
+            try:
+                res_json = await response.json(content_type=response_content_type)
+            except Exception:
+                response_text = await response.text()
+                logger.warning(f"【{self.cookie_id}】{api_name} 响应解析失败: {response_text[:300]}")
+                return {'ret': ['FAIL_SYS_RESPONSE_PARSE::响应解析失败'], 'raw_text': response_text}
+
+            await self._apply_response_cookie_updates(response.headers, source)
+            return res_json if isinstance(res_json, dict) else {'ret': ['FAIL_SYS_RESPONSE_INVALID::响应格式异常']}
+
+    async def fetch_im_user_info(self, session_id: str, session_type: int = 1,
+                                 is_owner: bool = False, message_id: str = None) -> Dict[str, Any]:
+        payload = {
+            'type': 0,
+            'sessionType': int(session_type or 1),
+            'sessionId': str(session_id),
+            'isOwner': bool(is_owner),
+        }
+        if message_id:
+            payload['messageId'] = str(message_id)
+
+        result = await self._post_mtop_api(
+            'mtop.taobao.idlemessage.pc.user.query',
+            '4.0',
+            payload,
+            source='im_user_query',
+        )
+        if any('SUCCESS::调用成功' in str(ret) for ret in (result.get('ret') or [])):
+            return result.get('data', {}) or {}
+        logger.warning(f"【{self.cookie_id}】获取IM用户信息失败: session_id={session_id}, ret={result.get('ret')}")
+        return {}
+
+    async def fetch_im_head_info(self, session_id: str, item_id: str, session_type: int = 1) -> Dict[str, Any]:
+        if not item_id:
+            return {}
+
+        result = await self._post_mtop_api(
+            'mtop.idle.trade.pc.message.headinfo',
+            '1.0',
+            {
+                'itemId': int(item_id) if str(item_id).isdigit() else str(item_id),
+                'sessionId': int(session_id) if str(session_id).isdigit() else str(session_id),
+                'sessionType': int(session_type or 1),
+            },
+            data_type='json',
+            response_content_type=None,
+            extra_params={'valueType': 'string'},
+            source='im_headinfo_query',
+        )
+        if any('SUCCESS::调用成功' in str(ret) for ret in (result.get('ret') or [])):
+            return result.get('data', {}) or {}
+        logger.warning(f"【{self.cookie_id}】获取IM会话头信息失败: session_id={session_id}, item_id={item_id}, ret={result.get('ret')}")
+        return {}
+
+    async def fetch_im_blacklist_status(self, session_id: str) -> Dict[str, Any]:
+        result = await self._post_mtop_api(
+            'mtop.taobao.idlemessage.pc.blacklist.query',
+            '1.0',
+            {'sessionId': str(session_id)},
+            source='im_blacklist_query',
+        )
+        if any('SUCCESS::调用成功' in str(ret) for ret in (result.get('ret') or [])):
+            return result.get('data', {}) or {}
+        logger.warning(f"【{self.cookie_id}】获取IM黑名单状态失败: session_id={session_id}, ret={result.get('ret')}")
+        return {}
+
     async def get_api_reply(self, msg_time, user_url, send_user_id, send_user_name, item_id, send_message, chat_id):
         """调用API获取回复消息"""
         try:
@@ -13622,6 +14099,31 @@ class XianyuLive:
                     # 记录发出的消息
                     msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                     logger.info(f"[{msg_time}] 【{reply_source}发出】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {reply}")
+                    try:
+                        from db_manager import db_manager as _db
+                        from chat_event_hub import publish_chat_message
+                        image_url = None
+                        media_url = None
+                        link_url = None
+                        extra_json = None
+                        _msg_id_db = _db.save_chat_message(
+                            cookie_id=self.cookie_id, chat_id=chat_id,
+                            sender_id=self.myid, sender_name=self.cookie_id,
+                            content=reply, content_type=1,
+                            image_url=image_url,
+                            item_id=item_id, direction=1, reply_source=reply_source,
+                            media_url=media_url, link_url=link_url, extra_json=extra_json,
+                        )
+                        publish_chat_message(self.cookie_id, {
+                            'msg_id': _msg_id_db, 'chat_id': chat_id,
+                            'sender_id': self.myid, 'sender_name': self.cookie_id,
+                            'content': reply, 'content_type': 1,
+                            'image_url': image_url,
+                            'item_id': item_id, 'direction': 1, 'reply_source': reply_source,
+                            'media_url': media_url, 'link_url': link_url, 'extra_json': extra_json,
+                        })
+                    except Exception as _e:
+                        logger.debug(f"保存/推送发出消息失败: {self._safe_str(_e)}")
             else:
                 msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】未找到匹配的回复规则，不回复")
@@ -14105,6 +14607,32 @@ class XianyuLive:
             if send_user_id == self.myid and not is_system_message:
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】[{msg_id}] 【手动发出】 商品({item_id}): {send_message}")
 
+                try:
+                    from db_manager import db_manager as _db
+                    from chat_event_hub import publish_chat_message
+                    image_url = self._extract_image_url_from_message(message) if content_type == 2 else None
+                    media_url = None
+                    link_url = None
+                    extra_json = None
+                    _msg_id_db = _db.save_chat_message(
+                        cookie_id=self.cookie_id, chat_id=chat_id,
+                        sender_id=self.myid, sender_name=self.cookie_id,
+                        content=send_message, content_type=content_type,
+                        image_url=image_url,
+                        item_id=item_id, direction=1, reply_source='手动',
+                        media_url=media_url, link_url=link_url, extra_json=extra_json,
+                    )
+                    publish_chat_message(self.cookie_id, {
+                        'msg_id': _msg_id_db, 'chat_id': chat_id,
+                        'sender_id': self.myid, 'sender_name': self.cookie_id,
+                        'content': send_message, 'content_type': content_type,
+                        'image_url': image_url,
+                        'item_id': item_id, 'direction': 1, 'reply_source': '手动',
+                        'media_url': media_url, 'link_url': link_url, 'extra_json': extra_json,
+                    })
+                except Exception as _e:
+                    logger.debug(f"保存/推送手动消息失败: {self._safe_str(_e)}")
+
                 # 暂停该chat_id的自动回复10分钟
                 pause_manager.pause_chat(chat_id, self.cookie_id)
 
@@ -14117,6 +14645,32 @@ class XianyuLive:
                 )
             else:
                 logger.info(f"[{msg_time}] 【收到】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {send_message}")
+                try:
+                    from db_manager import db_manager as _db
+                    from chat_event_hub import publish_chat_message
+                    image_url = self._extract_image_url_from_message(message) if content_type == 2 else None
+                    media_url = None
+                    link_url = None
+                    extra_json = None
+                    _msg_id_db = _db.save_chat_message(
+                        cookie_id=self.cookie_id, chat_id=chat_id,
+                        sender_id=send_user_id, sender_name=send_user_name,
+                        content=send_message, content_type=content_type,
+                        image_url=image_url,
+                        item_id=item_id, direction=2,
+                        media_url=media_url, link_url=link_url, extra_json=extra_json,
+                    )
+                    publish_chat_message(self.cookie_id, {
+                        'msg_id': _msg_id_db, 'chat_id': chat_id,
+                        'sender_id': send_user_id, 'sender_name': send_user_name,
+                        'content': send_message, 'content_type': content_type,
+                        'image_url': image_url,
+                        'item_id': item_id, 'direction': 2,
+                        'media_url': media_url, 'link_url': link_url, 'extra_json': extra_json,
+                    })
+                except Exception as _e:
+                    logger.debug(f"保存/推送聊天消息失败: {self._safe_str(_e)}")
+
                 if message_route == 'user_chat':
                     self.last_user_chat_time = time.time()
 

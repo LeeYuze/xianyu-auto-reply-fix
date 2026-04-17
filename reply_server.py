@@ -44,6 +44,7 @@ from utils.notification_dispatcher import (
     render_notification_template,
     resolve_verification_type_label,
 )
+from chat_event_hub import chat_event_hub, publish_chat_message
 from order_event_hub import order_event_hub, publish_order_update_event
 
 from loguru import logger
@@ -2447,6 +2448,811 @@ class SystemSettingCreateIn(BaseModel):
     description: Optional[str] = None
 
 
+class ChatSendRequest(BaseModel):
+    cookie_id: str
+    chat_id: str
+    to_user_id: str
+    message: str
+
+
+class SaveItemKeywordsRequest(BaseModel):
+    keywords: list
+    item_reply: Optional[str] = None
+
+
+class CopyKeywordsRequest(BaseModel):
+    source_item_id: str
+    target_item_ids: List[str]
+
+
+class ChatHydrationDebug(BaseModel):
+    success: bool
+    cookie_id: str
+    chat_id: str
+    stage: str
+    message: str
+    fetched: int = 0
+    saved: int = 0
+    normalized_count: int = 0
+    skipped_count: int = 0
+    sample_sender_id: Optional[str] = None
+    sample_sender_name: Optional[str] = None
+    sample_content: Optional[str] = None
+    remote_history_status: Optional[str] = None
+    remote_history_checked_at: Optional[str] = None
+    runtime_status: Optional[Dict[str, Any]] = None
+
+
+_chat_session_enrichment_cache: Dict[str, Dict[str, Any]] = {}
+_CHAT_SESSION_ENRICHMENT_TTL_SECONDS = 180
+_chat_history_probe_cache: Dict[str, Dict[str, Any]] = {}
+_CHAT_HISTORY_PROBE_TTL_SECONDS = 6 * 60 * 60
+
+
+def _build_chat_history_probe_key(cookie_id: str, chat_id: str) -> str:
+    return f"{str(cookie_id or '').strip()}::{str(chat_id or '').strip()}"
+
+
+def _get_cached_chat_history_probe(cookie_id: str, chat_id: str) -> Optional[Dict[str, Any]]:
+    cache_key = _build_chat_history_probe_key(cookie_id, chat_id)
+    cached = _chat_history_probe_cache.get(cache_key)
+    if not cached:
+        return None
+
+    checked_at = float(cached.get('checked_at') or 0)
+    if checked_at <= 0 or (time.time() - checked_at) > _CHAT_HISTORY_PROBE_TTL_SECONDS:
+        _chat_history_probe_cache.pop(cache_key, None)
+        return None
+
+    return dict(cached)
+
+
+def _set_cached_chat_history_probe(
+    cookie_id: str,
+    chat_id: str,
+    *,
+    status: str,
+    fetched: int = 0,
+    normalized_count: int = 0,
+    saved: int = 0,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    checked_at = time.time()
+    payload = {
+        'status': str(status or '').strip() or 'unknown',
+        'fetched': max(0, int(fetched or 0)),
+        'normalized_count': max(0, int(normalized_count or 0)),
+        'saved': max(0, int(saved or 0)),
+        'note': str(note or '').strip() or None,
+        'checked_at': checked_at,
+        'checked_at_display': datetime.fromtimestamp(checked_at, tz=LOCAL_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    _chat_history_probe_cache[_build_chat_history_probe_key(cookie_id, chat_id)] = payload
+    return dict(payload)
+
+
+def _apply_chat_history_probe_to_session(cookie_id: str, session: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(session or {})
+    chat_id = str(normalized.get('chat_id') or '').strip()
+    if not chat_id:
+        return normalized
+
+    is_candidate_only = str(normalized.get('hydration_source') or '').strip() == 'orders'
+    normalized['candidate_only'] = is_candidate_only
+    probe = _get_cached_chat_history_probe(cookie_id, chat_id)
+    if probe:
+        normalized['remote_history_status'] = probe.get('status')
+        normalized['remote_history_checked_at'] = probe.get('checked_at_display')
+        normalized['remote_history_note'] = probe.get('note')
+        normalized['remote_history_fetched'] = probe.get('fetched', 0)
+    elif is_candidate_only:
+        normalized['remote_history_status'] = 'unknown'
+        normalized['remote_history_checked_at'] = None
+        normalized['remote_history_note'] = '订单候选会话，尚未验证是否存在闲鱼聊天历史'
+        normalized['remote_history_fetched'] = 0
+
+    return normalized
+
+
+def _compact_chat_user_ext(user_ext: Any) -> Dict[str, Any]:
+    if not isinstance(user_ext, dict):
+        return {}
+    allowed_keys = {
+        'yuxiaopuDomain', 'yuxiaopuLevelImage', 'fansTag', 'userMedal',
+        'avatarPendant', 'chatBackground', 'guestChatBubble', 'ownerChatBubble'
+    }
+    return {key: value for key, value in user_ext.items() if key in allowed_keys and value}
+
+
+def _parse_item_pre_info(raw_value: Any) -> Dict[str, Any]:
+    parsed = _safe_json_loads(raw_value)
+    if parsed:
+        return parsed
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return {}
+    try:
+        return json.loads(raw_value.replace('\\"', '"'))
+    except Exception:
+        return {}
+
+
+def _normalize_headinfo_buttons(buttons: Any) -> List[Dict[str, Any]]:
+    normalized = []
+    if not isinstance(buttons, list):
+        return normalized
+    for button in buttons:
+        if not isinstance(button, dict):
+            continue
+        normalized.append({
+            'name': button.get('name'),
+            'style': button.get('style'),
+            'trade_action': button.get('tradeAction'),
+            'url': (((button.get('clickEvent') or {}).get('data') or {}).get('url')),
+        })
+    return normalized
+
+
+def _build_chat_session_cache_key(cookie_id: str, session: Dict[str, Any]) -> str:
+    return f"{cookie_id}:{session.get('chat_id') or ''}:{session.get('item_id') or ''}:{session.get('sender_id') or ''}"
+
+
+def _get_cached_chat_session_enrichment(cache_key: str) -> Optional[Dict[str, Any]]:
+    cached = _chat_session_enrichment_cache.get(cache_key)
+    if not cached:
+        return None
+    if (time.time() - float(cached.get('cached_at') or 0)) > _CHAT_SESSION_ENRICHMENT_TTL_SECONDS:
+        _chat_session_enrichment_cache.pop(cache_key, None)
+        return None
+    return dict(cached.get('value') or {})
+
+
+def _set_cached_chat_session_enrichment(cache_key: str, value: Dict[str, Any]) -> None:
+    _chat_session_enrichment_cache[cache_key] = {
+        'cached_at': time.time(),
+        'value': dict(value or {}),
+    }
+
+
+async def _enrich_single_chat_session(cookie_id: str, session: Dict[str, Any]) -> Dict[str, Any]:
+    from XianyuAutoAsync import XianyuLive
+
+    cache_key = _build_chat_session_cache_key(cookie_id, session)
+    cached = _get_cached_chat_session_enrichment(cache_key)
+    if cached is not None:
+        return {**session, **cached}
+
+    live_instance = XianyuLive.get_instance(cookie_id)
+    if not live_instance:
+        return session
+
+    session_id = str(session.get('chat_id') or '').strip()
+    if not session_id:
+        return session
+
+    item_id = str(session.get('item_id') or '').strip()
+    sender_id = str(session.get('sender_id') or session.get('buyer_id') or '').strip()
+    session_type = int(session.get('session_type') or 1)
+
+    enriched: Dict[str, Any] = {}
+
+    try:
+        user_info_result = await live_instance.fetch_im_user_info(
+            session_id=session_id,
+            session_type=session_type,
+            is_owner=False,
+            message_id=session.get('message_id') or None,
+        )
+        user_info = user_info_result.get('userInfo', {}) if isinstance(user_info_result, dict) else {}
+        if user_info:
+            enriched.update({
+                'avatar': user_info.get('logo'),
+                'fish_nick': user_info.get('fishNick') or user_info.get('nick') or session.get('buyer_name') or session.get('sender_name'),
+                'user_ext': _compact_chat_user_ext(user_info.get('ext')),
+                'buyer_name_resolved': user_info.get('fishNick') or user_info.get('nick') or session.get('buyer_name'),
+                'sender_id': sender_id or session.get('sender_id'),
+            })
+    except Exception as e:
+        logger.debug(f"会话用户信息增强失败: cookie_id={cookie_id}, session_id={session_id}, error={mask_sensitive_text(e)}")
+
+    if item_id:
+        try:
+            headinfo = await live_instance.fetch_im_head_info(session_id=session_id, item_id=item_id, session_type=session_type)
+            common_data = headinfo.get('commonData', {}) if isinstance(headinfo, dict) else {}
+            item_pre_info = _parse_item_pre_info(common_data.get('itemPreInfo'))
+            left_data = ((headinfo.get('left') or {}).get('data') or {}) if isinstance(headinfo, dict) else {}
+            middle_data = ((headinfo.get('middle') or {}).get('data') or {}) if isinstance(headinfo, dict) else {}
+            right_data = ((headinfo.get('right') or {}).get('data') or {}) if isinstance(headinfo, dict) else {}
+            ut_args = headinfo.get('utArgs', {}) if isinstance(headinfo, dict) else {}
+            enriched.update({
+                'headinfo_template': headinfo.get('template') if isinstance(headinfo, dict) else None,
+                'item_title': item_pre_info.get('title') or session.get('item_title'),
+                'item_price': item_pre_info.get('soldPrice') or middle_data.get('price'),
+                'item_pic': left_data.get('picUrl'),
+                'item_jump_url': left_data.get('jumpUrl'),
+                'item_subtitle': middle_data.get('subTitle'),
+                'item_tips': middle_data.get('tips'),
+                'action_buttons': _normalize_headinfo_buttons(right_data.get('btnList')),
+                'order_id': headinfo.get('orderId') if isinstance(headinfo, dict) else None,
+                'order_detail_url': headinfo.get('orderDetailUrl') if isinstance(headinfo, dict) else None,
+                'order_status_name': (ut_args.get('orderStatusName') if isinstance(ut_args, dict) else None),
+            })
+        except Exception as e:
+            logger.debug(f"会话头信息增强失败: cookie_id={cookie_id}, session_id={session_id}, item_id={item_id}, error={mask_sensitive_text(e)}")
+
+    try:
+        blacklist_info = await live_instance.fetch_im_blacklist_status(session_id=session_id)
+        if blacklist_info:
+            enriched['blacklist_status'] = {
+                'is_in_black': bool(blacklist_info.get('isInBlack')),
+                'show_blacklist': bool(blacklist_info.get('showBlackList')),
+            }
+    except Exception as e:
+        logger.debug(f"会话黑名单增强失败: cookie_id={cookie_id}, session_id={session_id}, error={mask_sensitive_text(e)}")
+
+    _set_cached_chat_session_enrichment(cache_key, enriched)
+    return {**session, **enriched}
+
+
+async def _enrich_chat_sessions(cookie_id: str, sessions: List[Dict[str, Any]], limit: int = 30) -> List[Dict[str, Any]]:
+    if not sessions:
+        return []
+    sessions = list(sessions)
+    priority_sessions = sessions[:max(1, min(limit, len(sessions)))]
+    remaining_sessions = sessions[len(priority_sessions):]
+    enriched_priority = []
+    for session in priority_sessions:
+        enriched_priority.append(await _enrich_single_chat_session(cookie_id, session))
+    return enriched_priority + remaining_sessions
+
+
+def _safe_json_loads(raw_value: Any) -> Dict[str, Any]:
+    if isinstance(raw_value, dict):
+        return raw_value
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return {}
+    try:
+        parsed = json.loads(raw_value)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _extract_history_message_payload(message: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(message, dict):
+        return {}
+    try:
+        message_1 = message.get('1', {}) if isinstance(message, dict) else {}
+        message_6 = message_1.get('6', {}) if isinstance(message_1, dict) else {}
+        message_6_3 = message_6.get('3', {}) if isinstance(message_6, dict) else {}
+        return _safe_json_loads(message_6_3.get('5', '') or '{}')
+    except Exception:
+        return {}
+
+
+def _extract_rich_message_fields(message: Dict[str, Any]) -> Dict[str, Any]:
+    payload = _extract_history_message_payload(message)
+    result = {
+        'display_type': None,
+        'content': '',
+        'image_url': None,
+        'media_url': None,
+        'link_url': None,
+        'extra_json': None,
+    }
+
+    if not payload:
+        return result
+
+    dx_card = payload.get('dxCard', {}) if isinstance(payload, dict) else {}
+    dx_item = dx_card.get('item', {}) if isinstance(dx_card, dict) else {}
+    main = dx_item.get('main', {}) if isinstance(dx_item, dict) else {}
+    ex_content = main.get('exContent', {}) if isinstance(main, dict) else {}
+    title = str(ex_content.get('title') or main.get('title') or payload.get('title') or '').strip()
+    content = str(ex_content.get('content') or payload.get('text') or '').strip()
+    button_text = str((ex_content.get('button') or {}).get('text') or '').strip()
+
+    image_url = (
+        ((payload.get('image') or {}).get('pics') or [{}])[0].get('url')
+        if isinstance(payload.get('image'), dict) and (payload.get('image').get('pics') or [])
+        else None
+    )
+    video_url = (
+        ((payload.get('video') or {}).get('playUrl'))
+        or ((payload.get('video') or {}).get('url'))
+        or ((main.get('video') or {}).get('playUrl') if isinstance(main.get('video'), dict) else None)
+    )
+    link_url = (
+        str(payload.get('targetUrl') or '').strip()
+        or str(payload.get('url') or '').strip()
+        or str((ex_content.get('button') or {}).get('actionUrl') or '').strip()
+    ) or None
+
+    item_id = None
+    item_title = None
+    item_image = None
+    if isinstance(dx_item, dict):
+        item_id = dx_item.get('itemId') or dx_item.get('id')
+        item_title = dx_item.get('title') or title
+        item_image = dx_item.get('itemMainPic') or dx_item.get('pic')
+
+    extra = {
+        'payload': payload,
+        'title': title or None,
+        'button_text': button_text or None,
+        'item_share': {
+            'item_id': item_id,
+            'title': item_title,
+            'image_url': item_image,
+            'seller_id': dx_item.get('itemSellerId') if isinstance(dx_item, dict) else None,
+        } if item_id or item_title or item_image else None,
+    }
+
+    if video_url:
+        result['display_type'] = 'video'
+        result['content'] = title or content or '[视频]'
+        result['media_url'] = str(video_url).strip()
+        result['image_url'] = image_url or item_image
+        result['link_url'] = link_url
+    elif image_url:
+        result['display_type'] = 'image'
+        result['content'] = title or content or '[图片]'
+        result['image_url'] = str(image_url).strip()
+        result['link_url'] = link_url
+    elif item_id or item_title:
+        result['display_type'] = 'item_share'
+        result['content'] = item_title or title or content or '[商品分享]'
+        result['image_url'] = item_image
+        result['link_url'] = link_url
+    elif link_url:
+        result['display_type'] = 'link'
+        result['content'] = title or content or button_text or '[链接]'
+        result['link_url'] = link_url
+    elif title or content or button_text:
+        result['display_type'] = 'card'
+        result['content'] = ' / '.join([part for part in [title, content, button_text] if part])
+
+    if result['display_type']:
+        result['extra_json'] = json.dumps(extra, ensure_ascii=False)
+
+    return result
+
+
+def _extract_history_message_text(message: Dict[str, Any]) -> str:
+    """从闲鱼历史消息结构中尽量提取可展示文本。"""
+    if not isinstance(message, dict):
+        return ''
+
+    try:
+        message_1 = message.get('1', {}) if isinstance(message, dict) else {}
+        message_10 = message_1.get('10', {}) if isinstance(message_1, dict) else {}
+        payload = _extract_history_message_payload(message)
+        candidates = [
+            message_10.get('reminderContent'),
+            message_10.get('detailNotice'),
+            message_10.get('reminderTitle'),
+            message_10.get('reminderNotice'),
+            (((payload.get('dxCard') or {}).get('item') or {}).get('main') or {}).get('title'),
+            ((((payload.get('dxCard') or {}).get('item') or {}).get('main') or {}).get('exContent') or {}).get('title'),
+            ((((payload.get('dxCard') or {}).get('item') or {}).get('main') or {}).get('exContent') or {}).get('content'),
+            ((((payload.get('dxCard') or {}).get('item') or {}).get('main') or {}).get('exContent') or {}).get('button', {}).get('text'),
+            (payload.get('text') if isinstance(payload, dict) else None),
+        ]
+        for candidate in candidates:
+            text = str(candidate or '').strip()
+            if text and text not in {'{}', '[]'}:
+                return text
+    except Exception:
+        pass
+
+    raw_text = str(message.get('raw') or '').strip()
+    return raw_text[:120] if raw_text else ''
+
+
+def _messages_need_remote_hydration(messages: List[Dict[str, Any]]) -> bool:
+    """本地消息为空或几乎都不可展示时，触发远端补拉。"""
+    if not messages:
+        return True
+
+    renderable_count = 0
+    for message in messages:
+        content = str((message or {}).get('content') or '').strip()
+        image_url = str((message or {}).get('image_url') or '').strip()
+        if content or image_url:
+            renderable_count += 1
+
+    return renderable_count == 0
+
+
+def _normalize_chat_history_message_record(
+    raw: Dict[str, Any],
+    cookie_id: str,
+    chat_id: str,
+    owner_user_id: Optional[str] = None,
+    fallback_item_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """将闲鱼历史消息结构转换为本地 chat_messages 记录格式。"""
+    if not isinstance(raw, dict):
+        logger.debug(f"聊天历史记录格式异常，raw 不是 dict: cookie_id={cookie_id}, chat_id={chat_id}, type={type(raw).__name__}")
+        return None
+
+    message = raw.get('message')
+    if not isinstance(message, dict):
+        logger.debug(
+            f"聊天历史记录缺少 message 结构: cookie_id={cookie_id}, chat_id={chat_id}, "
+            f"keys={list(raw.keys())[:8]}"
+        )
+        return None
+
+    sender_id = str(raw.get('send_user_id') or '').strip()
+    message_extension = raw.get('message_extension') if isinstance(raw.get('message_extension'), dict) else {}
+    sender_name = (
+        str(raw.get('send_user_name') or '').strip()
+        or str(message_extension.get('senderNick') or '').strip()
+        or str(message_extension.get('reminderTitle') or '').strip()
+        or sender_id
+        or chat_id
+    )
+    content = ''
+    content_type = 1
+    image_url = None
+    media_url = None
+    link_url = None
+    extra_json = None
+    item_id = None
+    created_at = None
+
+    try:
+        message_1 = message.get('1', {}) if isinstance(message, dict) else {}
+        message_10 = message_1.get('10', {}) if isinstance(message_1, dict) else {}
+        created_ts = raw.get('created_at', message_1.get('5'))
+        created_at = _format_history_created_at(created_ts)
+        content = _extract_history_message_text(message)
+        message_6 = message_1.get('6', {}) if isinstance(message_1, dict) else {}
+        message_6_3 = message_6.get('3', {}) if isinstance(message_6, dict) else {}
+        content_type = int(message_6_3.get('4', 1) or 1)
+        rich_fields = _extract_rich_message_fields(message)
+        if rich_fields.get('display_type') == 'image':
+            content_type = 2
+        elif rich_fields.get('display_type') == 'video':
+            content_type = 3
+        elif rich_fields.get('display_type') == 'link':
+            content_type = 4
+        elif rich_fields.get('display_type') == 'item_share':
+            content_type = 5
+        elif rich_fields.get('display_type') == 'card':
+            content_type = 6
+        if rich_fields.get('content'):
+            content = rich_fields.get('content')
+        image_url = rich_fields.get('image_url') or image_url
+        media_url = rich_fields.get('media_url')
+        link_url = rich_fields.get('link_url')
+        extra_json = rich_fields.get('extra_json')
+        if content_type == 2:
+            content_json_str = message_6_3.get('5', '')
+            if content_json_str:
+                content_obj = json.loads(content_json_str)
+                pics = content_obj.get('image', {}).get('pics', [])
+                if pics:
+                    image_url = pics[0].get('url', '') or image_url
+            if not content:
+                content = '[图片]'
+        elif content_type == 26 and not content:
+            card_title = (
+                (((_extract_history_message_payload(message).get('dxCard') or {}).get('item') or {}).get('main') or {}).get('exContent', {})
+            )
+            content = str(card_title.get('title') or message_10.get('detailNotice') or message_10.get('reminderContent') or '[交易卡片]').strip()
+        reminder_url = str(message_10.get('reminderUrl') or '').strip()
+        if reminder_url:
+            parsed = urlparse(reminder_url)
+            item_id = parse_qs(parsed.query or '').get('itemId', [None])[0]
+            if not link_url:
+                link_url = reminder_url
+    except Exception as normalize_exc:
+        logger.warning(
+            f"聊天历史记录解析失败: cookie_id={cookie_id}, chat_id={chat_id}, "
+            f"sender_id={sender_id or '-'}, error={mask_sensitive_text(normalize_exc)}"
+        )
+
+    if not content:
+        fallback_content = (
+            str(message_extension.get('detailNotice') or '').strip()
+            or str(message_extension.get('reminderContent') or '').strip()
+            or str(message_extension.get('reminderNotice') or '').strip()
+        )
+        if fallback_content:
+            content = fallback_content
+
+    if not item_id and fallback_item_id:
+        item_id = fallback_item_id
+
+    owner_id = str(owner_user_id or '').strip()
+    direction = 1 if sender_id and owner_id and sender_id == owner_id else 2
+
+    return {
+        'cookie_id': cookie_id,
+        'chat_id': chat_id,
+        'sender_id': sender_id,
+        'sender_name': sender_name,
+        'content': content or ('[图片]' if content_type == 2 else '[系统消息]'),
+        'content_type': content_type,
+        'image_url': image_url,
+        'item_id': item_id,
+        'direction': direction,
+        'reply_source': None,
+        'media_url': media_url,
+        'link_url': link_url,
+        'extra_json': extra_json,
+        'created_at': created_at,
+    }
+
+
+def _format_history_created_at(raw_value: Any) -> Optional[str]:
+    if raw_value in (None, '', 0, '0'):
+        return None
+
+    if isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return None
+        if any(sep in text for sep in ('-', '/')) and ':' in text:
+            normalized = text.replace('T', ' ')
+            return normalized[:19]
+        raw_value = text
+
+    try:
+        value = int(float(raw_value))
+    except (TypeError, ValueError):
+        return None
+
+    if value <= 0:
+        return None
+
+    if value < 10**11:
+        value *= 1000
+
+    try:
+        return datetime.fromtimestamp(value / 1000, tz=LOCAL_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _build_chat_message_signature(record: Dict[str, Any]) -> tuple:
+    return (
+        str(record.get('chat_id') or ''),
+        str(record.get('sender_id') or ''),
+        str(record.get('content') or ''),
+        int(record.get('content_type') or 0),
+        str(record.get('image_url') or ''),
+        str(record.get('media_url') or ''),
+        str(record.get('link_url') or ''),
+        str(record.get('item_id') or ''),
+        int(record.get('direction') or 0),
+        str(record.get('created_at') or ''),
+    )
+
+
+def _build_chat_sessions_from_recent_orders(cookie_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """当本地 chat_messages 为空时，基于最近订单构造可点击会话入口。"""
+    sessions: List[Dict[str, Any]] = []
+    seen_chat_ids = set()
+    orders = db_manager.get_orders_by_cookie(cookie_id, limit=max(limit * 4, 100))
+
+    for order in orders:
+        sid = str(order.get('sid') or '').strip()
+        if not sid:
+            continue
+        chat_id = sid.split('@')[0]
+        if not chat_id or chat_id in seen_chat_ids:
+            continue
+        seen_chat_ids.add(chat_id)
+        sessions.append({
+            'chat_id': chat_id,
+            'sender_id': order.get('buyer_id') or '',
+            'buyer_id': order.get('buyer_id') or '',
+            'sender_name': order.get('buyer_nick') or order.get('buyer_id') or chat_id,
+            'buyer_name': order.get('buyer_nick') or '',
+            'content': '点击补拉该会话历史消息',
+            'content_type': 1,
+            'item_id': order.get('item_id') or '',
+            'direction': 2,
+            'created_at': order.get('updated_at') or order.get('created_at') or '',
+            'hydration_source': 'orders',
+        })
+        if len(sessions) >= limit:
+            break
+
+    sessions.sort(key=lambda item: item.get('created_at') or '', reverse=True)
+    return sessions
+
+
+def _merge_chat_sessions_with_order_fallback(
+    local_sessions: List[Dict[str, Any]],
+    fallback_sessions: List[Dict[str, Any]],
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """合并本地会话和订单兜底会话，避免本地只有少量会话时隐藏其他历史入口。"""
+    merged: List[Dict[str, Any]] = []
+    seen_chat_ids = set()
+
+    for session in local_sessions or []:
+        chat_id = str(session.get('chat_id') or '').strip()
+        if not chat_id or chat_id in seen_chat_ids:
+            continue
+        merged.append(session)
+        seen_chat_ids.add(chat_id)
+
+    for session in fallback_sessions or []:
+        chat_id = str(session.get('chat_id') or '').strip()
+        if not chat_id or chat_id in seen_chat_ids:
+            continue
+        merged.append(session)
+        seen_chat_ids.add(chat_id)
+
+    merged.sort(key=lambda item: str(item.get('created_at') or ''), reverse=True)
+    return merged[:limit]
+
+
+def _annotate_chat_sessions(cookie_id: str, sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    annotated = []
+    for session in sessions or []:
+        annotated.append(_apply_chat_history_probe_to_session(cookie_id, session))
+    return annotated
+
+
+async def _hydrate_chat_history_from_goofish(cookie_id: str, chat_id: str, page_size: int = 50) -> Dict[str, Any]:
+    """从闲鱼拉取已知会话历史消息并回填到本地库。"""
+    from XianyuAutoAsync import XianyuLive
+
+    live_instance = XianyuLive.get_instance(cookie_id)
+    if not live_instance:
+        logger.warning(f"聊天历史补拉失败：账号未启动，cookie_id={cookie_id}, chat_id={chat_id}")
+        raise HTTPException(status_code=400, detail="账号未启动，暂无法拉取历史消息")
+
+    normalized_chat_id = str(chat_id or '').strip().split('@')[0]
+    if not normalized_chat_id:
+        logger.warning(f"聊天历史补拉失败：缺少会话ID，cookie_id={cookie_id}, raw_chat_id={chat_id}")
+        raise HTTPException(status_code=400, detail="缺少会话ID")
+
+    runtime_status = _build_live_runtime_status(cookie_id)
+    logger.info(
+        f"开始补拉聊天历史: cookie_id={cookie_id}, chat_id={normalized_chat_id}, page_size={page_size}, "
+        f"connection_state={runtime_status.get('connection_state')}, ws_ready={runtime_status.get('ws_ready')}, "
+        f"session_ready={runtime_status.get('session_ready')}, message_stream_ready={runtime_status.get('message_stream_ready')}"
+    )
+
+    history_messages = await _run_live_instance_on_manager_loop(
+        cookie_id,
+        lambda: live_instance.fetch_conversation_history_with_fallback(
+            normalized_chat_id,
+            page_size=max(1, min(page_size, 100)),
+            isolated_timeout=12,
+        ),
+        timeout=60,
+    )
+
+    logger.info(
+        f"聊天历史补拉返回: cookie_id={cookie_id}, chat_id={normalized_chat_id}, fetched={len(history_messages or [])}"
+    )
+
+    recent_order = db_manager.get_recent_order_by_sid(f"{normalized_chat_id}@goofish", cookie_id=cookie_id, minutes=10080)
+    fallback_item_id = recent_order.get('item_id') if recent_order else None
+    owner_user_id = str(getattr(live_instance, 'myid', '') or '').strip()
+    if fallback_item_id:
+        logger.info(
+            f"聊天历史补拉匹配到商品上下文: cookie_id={cookie_id}, chat_id={normalized_chat_id}, item_id={fallback_item_id}"
+        )
+    else:
+        logger.info(
+            f"聊天历史补拉未匹配到商品上下文: cookie_id={cookie_id}, chat_id={normalized_chat_id}"
+        )
+
+    normalized_count = 0
+    skipped_count = 0
+    sample_sender_id = None
+    sample_sender_name = None
+    sample_content = None
+
+    existing_messages = db_manager.get_chat_messages(cookie_id, normalized_chat_id, limit=2000)
+    existing_signatures = {
+        _build_chat_message_signature(message)
+        for message in existing_messages
+    }
+    saved_count = 0
+    for index, raw in enumerate(history_messages):
+        record = _normalize_chat_history_message_record(
+            raw,
+            cookie_id,
+            normalized_chat_id,
+            owner_user_id=owner_user_id,
+            fallback_item_id=fallback_item_id,
+        )
+        if not record:
+            skipped_count += 1
+            continue
+        normalized_count += 1
+        if sample_sender_id is None:
+            sample_sender_id = record.get('sender_id')
+            sample_sender_name = record.get('sender_name')
+            sample_content = str(record.get('content') or '')[:80]
+        signature = _build_chat_message_signature(record)
+        if signature in existing_signatures:
+            skipped_count += 1
+            continue
+        msg_id = db_manager.save_chat_message(**record)
+        if msg_id:
+            saved_count += 1
+            existing_signatures.add(signature)
+        else:
+            logger.warning(
+                f"聊天历史入库返回空ID: cookie_id={cookie_id}, chat_id={normalized_chat_id}, index={index}, "
+                f"sender_id={record.get('sender_id')}, content_type={record.get('content_type')}"
+            )
+
+    if history_messages and normalized_count == 0:
+        logger.warning(
+            f"聊天历史补拉拿到数据但全部归一化失败: cookie_id={cookie_id}, chat_id={normalized_chat_id}, "
+            f"fetched={len(history_messages)}, skipped={skipped_count}, sample_keys={list(history_messages[0].keys())[:8]}"
+        )
+
+    if not history_messages:
+        probe = _set_cached_chat_history_probe(
+            cookie_id,
+            normalized_chat_id,
+            status='empty',
+            fetched=0,
+            normalized_count=normalized_count,
+            saved=saved_count,
+            note='闲鱼返回空历史列表，当前会话可能只是订单候选入口',
+        )
+        logger.warning(
+            f"聊天历史补拉返回空列表: cookie_id={cookie_id}, chat_id={normalized_chat_id}, "
+            f"connection_state={runtime_status.get('connection_state')}, ws_ready={runtime_status.get('ws_ready')}, "
+            f"session_ready={runtime_status.get('session_ready')}"
+        )
+    else:
+        probe_status = 'available' if normalized_count > 0 or saved_count > 0 else 'unrenderable'
+        probe_note = None
+        if probe_status == 'unrenderable':
+            probe_note = '闲鱼返回了历史，但未能转成可展示的本地消息'
+        probe = _set_cached_chat_history_probe(
+            cookie_id,
+            normalized_chat_id,
+            status=probe_status,
+            fetched=len(history_messages or []),
+            normalized_count=normalized_count,
+            saved=saved_count,
+            note=probe_note,
+        )
+
+    return {
+        'success': True,
+        'chat_id': normalized_chat_id,
+        'fetched': len(history_messages or []),
+        'saved': saved_count,
+        'normalized_count': normalized_count,
+        'skipped_count': skipped_count,
+        'sample_sender_id': sample_sender_id,
+        'sample_sender_name': sample_sender_name,
+        'sample_content': sample_content,
+        'remote_history_status': probe.get('status') if probe else None,
+        'remote_history_checked_at': probe.get('checked_at_display') if probe else None,
+        'messages': db_manager.get_chat_messages(cookie_id, normalized_chat_id, limit=min(page_size, 100)),
+        'runtime_status': runtime_status,
+    }
+
+
+async def _rebuild_chat_history_from_goofish(cookie_id: str, chat_id: str, page_size: int = 50) -> Dict[str, Any]:
+    """删除本地会话旧记录后，重新从闲鱼补拉历史。"""
+    normalized_chat_id = str(chat_id or '').strip().split('@')[0]
+    deleted = db_manager.delete_chat_messages_by_session(cookie_id, normalized_chat_id)
+    logger.info(
+        f"开始重建聊天历史: cookie_id={cookie_id}, chat_id={normalized_chat_id}, deleted_local={deleted}, page_size={page_size}"
+    )
+    result = await _hydrate_chat_history_from_goofish(cookie_id, normalized_chat_id, page_size=page_size)
+    result['deleted_local'] = deleted
+    return result
+
+
 def _get_user_cookies_map(current_user: Dict[str, Any]) -> Dict[str, str]:
     user_id = current_user['user_id']
     return db_manager.get_all_cookies(user_id)
@@ -2553,6 +3359,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'state_last_changed_at_display': None,
         'cookie_refresh_enabled': None,
         'manual_refresh_active': False,
+        'auth_recovery_owner': None,
     }
     if not cleaned_cid:
         return runtime_status
@@ -2573,6 +3380,8 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     else:
         if not live_instance:
             live_instance = XianyuLive.get_instance(cleaned_cid)
+        auth_recovery_state = XianyuLive.get_auth_recovery_lock_state(cleaned_cid)
+        runtime_status['auth_recovery_owner'] = (auth_recovery_state or {}).get('owner')
 
     if not live_instance:
         return runtime_status
@@ -3383,13 +4192,35 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
     """后台执行账号密码登录任务"""
     manual_refresh_acquired = False
     manual_refresh_owner = f"password_login:{session_id}"
+    auth_recovery_owner = f"manual_password_login:{session_id}"
+    auth_recovery_acquired = False
     login_thread_started = False
     try:
         log_with_user('info', f"开始执行账号密码登录任务: {session_id}, 账号: {account_id}", current_user)
 
+        from XianyuAutoAsync import XianyuLive
+
         is_refresh_mode = password_login_sessions.get(session_id, {}).get('refresh_mode', False)
+        auth_session_state = XianyuLive.begin_auth_recovery_session(
+            account_id,
+            auth_recovery_owner,
+            mode='manual_cookie_refresh' if is_refresh_mode else 'manual_password_login',
+            source=manual_refresh_owner,
+            force_replace=False,
+        )
+        auth_recovery_acquired = auth_session_state.get('started', False)
+        if auth_session_state.get('already_active'):
+            active_owner = auth_session_state.get('active_owner', 'unknown')
+            _set_password_login_session_status(
+                session_id,
+                'failed',
+                error=f'该账号已有认证恢复流程进行中，请先完成当前验证或稍后再试（owner={active_owner}）'
+            )
+            _update_session_risk_log(session_id, 'failed', error_message=f'认证恢复流程进行中: {active_owner}')
+            log_with_user('warning', f"账号已有认证恢复流程在执行，拒绝重复触发: {account_id}, owner={active_owner}", current_user)
+            return
+
         if is_refresh_mode:
-            from XianyuAutoAsync import XianyuLive
             manual_refresh_state = XianyuLive.begin_manual_refresh(account_id, source=manual_refresh_owner)
             manual_refresh_acquired = manual_refresh_state.get('started', False)
             if manual_refresh_state.get('already_active'):
@@ -3475,7 +4306,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                                 account_id,
                                 notification_message,
                                 title='闲鱼账号需要验证',
-                                notification_type='face_verification',
+                                notification_type='face_verify',
                                 attachment_path=actual_screenshot_path,
                             )
                             if notification_sent:
@@ -3522,7 +4353,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                                 account_id,
                                 notification_message,
                                 title='闲鱼账号需要验证',
-                                notification_type='face_verification',
+                                notification_type='face_verify',
                             )
                             if notification_sent:
                                 log_with_user('info', f"✅ 已发送账号验证通知: {account_id}", current_user)
@@ -3820,6 +4651,19 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                         log_with_user('warning', f"{login_type}成功通知未发送成功: {account_id}", current_user)
                 except Exception as notify_err:
                     log_with_user('warning', f"发送登录成功通知失败: {account_id}, 错误: {str(notify_err)}", current_user)
+
+                if is_refresh_mode and session_id in password_login_sessions:
+                    screenshot_path = password_login_sessions[session_id].get('screenshot_path')
+                    verification_url = password_login_sessions[session_id].get('verification_url')
+                    verification_type = password_login_sessions[session_id].get('verification_type')
+                    if screenshot_path or verification_url:
+                        _set_password_login_session_status(
+                            session_id,
+                            'success',
+                            screenshot_path=screenshot_path,
+                            verification_url=verification_url,
+                            verification_type=verification_type,
+                        )
                 
             except Exception as e:
                 error_msg = str(e)
@@ -3846,6 +4690,14 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                         log_with_user('info', f"已结束手动刷新保护: {account_id}", current_user)
                     except Exception as manual_cleanup_e:
                         log_with_user('warning', f"结束手动刷新保护失败: {account_id}, 错误: {str(manual_cleanup_e)}", current_user)
+
+                if auth_recovery_acquired:
+                    try:
+                        from XianyuAutoAsync import XianyuLive
+                        XianyuLive.end_auth_recovery_session(account_id, auth_recovery_owner)
+                        log_with_user('info', f"已结束认证恢复单飞锁: {account_id}", current_user)
+                    except Exception as auth_cleanup_e:
+                        log_with_user('warning', f"结束认证恢复单飞锁失败: {account_id}, 错误: {str(auth_cleanup_e)}", current_user)
         
         # 在后台线程中执行登录
         login_thread = threading.Thread(target=run_login, daemon=True)
@@ -3860,6 +4712,12 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
             try:
                 from XianyuAutoAsync import XianyuLive
                 XianyuLive.end_manual_refresh(account_id, source=manual_refresh_owner)
+            except Exception:
+                pass
+        if auth_recovery_acquired and not login_thread_started:
+            try:
+                from XianyuAutoAsync import XianyuLive
+                XianyuLive.end_auth_recovery_session(account_id, auth_recovery_owner)
             except Exception:
                 pass
         import traceback
@@ -5286,6 +6144,15 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
                 'account_id': '测试账号',
                 'time': time_module.strftime('%Y-%m-%d %H:%M:%S'),
                 'cookie_count': '30'
+            },
+            'account_paused': {
+                'account_id': '测试账号',
+                'status_note': '待二维码验证',
+                'pause_reason': '二维码验证',
+                'time': time_module.strftime('%Y-%m-%d %H:%M:%S'),
+                'error_message': '检测到需要人工完成的二维码验证',
+                'verification_url': 'https://passport.goofish.com/mini_login.htm?example=test',
+                'action_hint': '请先完成验证，再恢复账号运行。'
             }
         }
 
@@ -9982,6 +10849,342 @@ def stream_user_orders(current_user: Dict[str, Any] = Depends(get_current_user))
             'X-Accel-Buffering': 'no',
         }
     )
+
+
+@app.get('/api/chat/sessions')
+async def get_chat_sessions(
+    cookie_id: str = None,
+    include_order_fallback: bool = True,
+    limit: int = 100,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """获取指定账号的会话列表"""
+    try:
+        if not cookie_id:
+            raise HTTPException(status_code=400, detail="缺少 cookie_id 参数")
+        cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        sessions = db_manager.get_chat_sessions(cookie_id, limit=min(limit, 200))
+        logger.info(
+            f"获取聊天会话列表: cookie_id={cookie_id}, local_sessions={len(sessions)}, include_order_fallback={include_order_fallback}, limit={limit}"
+        )
+        if include_order_fallback:
+            fallback_sessions = _build_chat_sessions_from_recent_orders(cookie_id, limit=min(max(limit, 50), 300))
+            logger.info(f"聊天会话列表订单兜底结果: cookie_id={cookie_id}, fallback_sessions={len(fallback_sessions)}")
+            sessions = _merge_chat_sessions_with_order_fallback(sessions, fallback_sessions, limit=min(max(limit, 50), 300))
+            logger.info(f"聊天会话列表合并结果: cookie_id={cookie_id}, merged_sessions={len(sessions)}")
+        sessions = _annotate_chat_sessions(cookie_id, sessions)
+        sessions = await _enrich_chat_sessions(cookie_id, sessions, limit=min(max(limit, 20), 30))
+        return {'success': True, 'sessions': sessions}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取会话列表失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail="获取会话列表失败")
+
+
+@app.get('/api/chat/messages')
+async def get_chat_messages(
+    cookie_id: str = None,
+    chat_id: str = None,
+    limit: int = 50,
+    before_id: int = None,
+    hydrate_remote: bool = False,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """获取指定会话的消息列表"""
+    try:
+        if not cookie_id or not chat_id:
+            raise HTTPException(status_code=400, detail="缺少 cookie_id 或 chat_id 参数")
+        cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        messages = db_manager.get_chat_messages(cookie_id, chat_id, limit=min(limit, 100), before_id=before_id)
+        if hydrate_remote and not before_id and _messages_need_remote_hydration(messages):
+            logger.info(
+                f"聊天消息命中远端补拉条件: cookie_id={cookie_id}, chat_id={chat_id}, local_count={len(messages)}"
+            )
+            hydrated = await _hydrate_chat_history_from_goofish(cookie_id, chat_id, page_size=min(limit, 100))
+            messages = hydrated.get('messages', [])
+        return {'success': True, 'messages': messages}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取聊天消息失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail="获取聊天消息失败")
+
+
+@app.post('/api/chat/messages/hydrate')
+async def hydrate_chat_messages(
+    cookie_id: str,
+    chat_id: str,
+    limit: int = 50,
+    rebuild: bool = False,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """按需从闲鱼拉取已知会话历史消息并写回本地。"""
+    try:
+        cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        if rebuild:
+            return await _rebuild_chat_history_from_goofish(cookie_id, chat_id, page_size=min(limit, 100))
+        return await _hydrate_chat_history_from_goofish(cookie_id, chat_id, page_size=min(limit, 100))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"回填聊天历史失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("回填聊天历史失败，请稍后重试"))
+
+
+@app.get('/api/chat/messages/hydrate-debug', response_model=ChatHydrationDebug)
+async def hydrate_chat_messages_debug(
+    cookie_id: str,
+    chat_id: str,
+    limit: int = 50,
+    rebuild: bool = False,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """调试专用：返回聊天历史补拉过程中的关键诊断信息。"""
+    cookie_id = _ensure_cookie_access(cookie_id, current_user)
+    normalized_chat_id = str(chat_id or '').strip().split('@')[0]
+    runtime_status = _build_live_runtime_status(cookie_id)
+
+    try:
+        if rebuild:
+            result = await _rebuild_chat_history_from_goofish(cookie_id, normalized_chat_id, page_size=min(limit, 100))
+        else:
+            result = await _hydrate_chat_history_from_goofish(cookie_id, normalized_chat_id, page_size=min(limit, 100))
+        message = '补拉成功'
+        if result.get('fetched', 0) == 0:
+            message = '补拉请求成功，但闲鱼返回空历史列表'
+        elif result.get('normalized_count', 0) == 0:
+            message = '闲鱼返回了数据，但未能成功归一化为本地聊天记录'
+        elif result.get('saved', 0) == 0:
+            message = '历史消息已归一化，但未成功写入本地库'
+        elif rebuild:
+            message = f"会话已重建，本地旧记录删除 {result.get('deleted_local', 0)} 条"
+
+        return ChatHydrationDebug(
+            success=True,
+            cookie_id=cookie_id,
+            chat_id=normalized_chat_id,
+            stage='completed',
+            message=message,
+            fetched=result.get('fetched', 0),
+            saved=result.get('saved', 0),
+            normalized_count=result.get('normalized_count', 0),
+            skipped_count=result.get('skipped_count', 0),
+            sample_sender_id=result.get('sample_sender_id'),
+            sample_sender_name=result.get('sample_sender_name'),
+            sample_content=result.get('sample_content'),
+            remote_history_status=result.get('remote_history_status'),
+            remote_history_checked_at=result.get('remote_history_checked_at'),
+            runtime_status=result.get('runtime_status') or runtime_status,
+        )
+    except HTTPException as exc:
+        logger.warning(
+            f"聊天历史补拉调试失败: cookie_id={cookie_id}, chat_id={normalized_chat_id}, "
+            f"status={exc.status_code}, detail={mask_sensitive_text(exc.detail)}"
+        )
+        return ChatHydrationDebug(
+            success=False,
+            cookie_id=cookie_id,
+            chat_id=normalized_chat_id,
+            stage='http_error',
+            message=str(exc.detail),
+            remote_history_status='http_error',
+            runtime_status=runtime_status,
+        )
+    except Exception as exc:
+        logger.error(
+            f"聊天历史补拉调试异常: cookie_id={cookie_id}, chat_id={normalized_chat_id}, "
+            f"error={mask_sensitive_text(exc)}"
+        )
+        return ChatHydrationDebug(
+            success=False,
+            cookie_id=cookie_id,
+            chat_id=normalized_chat_id,
+            stage='exception',
+            message=safe_client_error('补拉调试发生异常，请查看后端日志'),
+            remote_history_status='exception',
+            runtime_status=runtime_status,
+        )
+
+
+@app.post('/api/chat/send')
+async def chat_send_message(
+    req: ChatSendRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """在线客服发送消息"""
+    try:
+        cookie_id = _ensure_cookie_access(req.cookie_id, current_user)
+
+        from XianyuAutoAsync import XianyuLive, ConnectionState
+        live_instance = XianyuLive.get_instance(cookie_id)
+        if not live_instance:
+            raise HTTPException(status_code=400, detail="账号未启动")
+        if live_instance.connection_state != ConnectionState.CONNECTED:
+            raise HTTPException(status_code=400, detail="账号WebSocket未连接")
+        if not live_instance.ws:
+            raise HTTPException(status_code=400, detail="WebSocket连接未就绪")
+
+        await _run_live_instance_on_manager_loop(
+            cookie_id,
+            lambda: live_instance.send_msg(
+                live_instance.ws, req.chat_id, req.to_user_id, req.message
+            ),
+            timeout=15,
+        )
+
+        return {'success': True, 'message': '发送成功'}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"客服发送消息失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail="发送消息失败")
+
+
+@app.get('/api/chat/stream')
+def stream_chat_messages(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """聊天消息实时事件流"""
+    user_id = current_user['user_id']
+    subscriber = chat_event_hub.subscribe(user_id)
+
+    def event_generator():
+        try:
+            yield format_sse_event('stream.ready', {'type': 'stream.ready', 'timestamp': int(time.time() * 1000)})
+            while True:
+                try:
+                    event = subscriber.get(timeout=25)
+                    yield format_sse_event(event.get('type', 'chat.message'), event)
+                except queue.Empty:
+                    yield format_sse_event('ping', {'type': 'ping', 'timestamp': int(time.time() * 1000)})
+        finally:
+            chat_event_hub.unsubscribe(user_id, subscriber)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+        }
+    )
+
+
+@app.get('/api/chat/accounts')
+def get_chat_accounts(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取当前用户的所有账号列表（在线客服三栏布局用）"""
+    try:
+        user_cookies = _get_user_cookies_map(current_user)
+        accounts = []
+        for cid in user_cookies.keys():
+            status = _build_live_runtime_status(cid)
+            detail = db_manager.get_cookie_details(cid) or {}
+            display_name = detail.get('remark') or detail.get('username') or cid
+            accounts.append({
+                'id': cid,
+                'name': display_name,
+                'enabled': db_manager.get_cookie_status(cid),
+                'connected': status.get('connection_state') == 'connected' if status else False,
+            })
+        return {'success': True, 'accounts': accounts}
+    except Exception as e:
+        logger.error(f"获取聊天账号列表失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail="获取账号列表失败")
+
+
+@app.get('/api/chat/keywords/{cid}/item/{item_id}')
+def get_item_keywords(
+    cid: str, item_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """获取指定商品的关键词列表"""
+    try:
+        cid = _ensure_cookie_access(cid, current_user)
+        keywords = db_manager.get_keywords_by_item_id(cid, item_id)
+        item_reply_data = db_manager.get_item_reply(cid, item_id)
+        item_reply = item_reply_data.get('reply_content') if item_reply_data else None
+        return {'success': True, 'keywords': keywords, 'item_reply': item_reply}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取商品关键词失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail="获取商品关键词失败")
+
+
+@app.post('/api/chat/keywords/{cid}/item/{item_id}')
+def save_item_keywords(
+    cid: str, item_id: str,
+    req: SaveItemKeywordsRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """保存指定商品的关键词和指定商品回复"""
+    try:
+        cid = _ensure_cookie_access(cid, current_user)
+        success = db_manager.save_keywords_for_item(cid, item_id, req.keywords)
+        if req.item_reply is not None:
+            reply_content = str(req.item_reply or '').strip()
+            if reply_content:
+                db_manager.update_item_reply(cid, item_id, reply_content)
+            else:
+                db_manager.delete_item_reply(cid, item_id)
+        return {'success': success, 'count': len(req.keywords)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"保存商品关键词失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail="保存商品关键词失败")
+
+
+@app.post('/api/chat/keywords/{cid}/copy')
+def copy_item_keywords(
+    cid: str,
+    req: CopyKeywordsRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """复制商品关键词和指定商品回复到其他商品"""
+    try:
+        cid = _ensure_cookie_access(cid, current_user)
+        results = {}
+        source_reply = db_manager.get_item_reply(cid, req.source_item_id)
+        source_reply_content = source_reply.get('reply_content', '') if source_reply else ''
+
+        for target in req.target_item_ids:
+            if target == req.source_item_id:
+                continue
+            count = db_manager.copy_keywords_to_item(cid, req.source_item_id, target)
+            results[target] = count
+            if source_reply_content:
+                db_manager.update_item_reply(cid, target, source_reply_content)
+
+        return {'success': True, 'results': results, 'total': sum(results.values())}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"复制商品关键词失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail="复制商品关键词失败")
+
+
+@app.get('/api/chat/items/{cid}')
+def get_account_items(
+    cid: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """获取账号下的商品列表（用于复制回复的目标选择）"""
+    try:
+        cid = _ensure_cookie_access(cid, current_user)
+        cursor = db_manager.conn.cursor()
+        db_manager._execute_sql(cursor, """
+            SELECT item_id, item_title FROM item_info
+            WHERE cookie_id = ? ORDER BY item_id
+        """, (cid,))
+        rows = cursor.fetchall()
+        items = [{'item_id': r[0], 'item_title': r[1]} for r in rows]
+        return {'success': True, 'items': items}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取商品列表失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail="获取商品列表失败")
 
 
 @app.delete('/api/orders/{order_id}')
