@@ -291,6 +291,7 @@ build/
 
 # 文档文件（除了README.md）
 *.md
+!AGENTS.md
 !README.md
 !CHANGELOG.md
 !CONTRIBUTING.md
@@ -302,6 +303,8 @@ build/
 *.local.yml
 *.dev.yml
 *.test.yml
+tmp_remote_debug/
+debug_*.jpg
 config.*.yml
 !global_config.yml
 
