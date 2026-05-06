@@ -1904,6 +1904,9 @@ class XianyuLive:
         if not cookies_str:
             raise ValueError("未提供cookies，请在global_config.yml中配置COOKIES_STR或通过参数传入")
 
+        # 清理从浏览器/记事本粘贴时常见的 BOM 与首尾空白，避免 trans_cookies 解析失败
+        cookies_str = str(cookies_str).replace("\ufeff", "").strip()
+
         logger.info(f"【{cookie_id}】解析cookies...")
         self.cookies = trans_cookies(cookies_str)
         logger.info(f"【{cookie_id}】cookies解析完成，包含字段: {list(self.cookies.keys())}")
@@ -3233,9 +3236,15 @@ class XianyuLive:
         import aiohttp
         
         try:
-            # 好评接口地址
-            comment_api_url = "http://119.29.64.68:8081/comment"
-            
+            # 好评接口地址：从系统设置读取；未配置则拒绝调用，避免向未知第三方泄露 Cookie
+            comment_api_url = (db_manager.get_system_setting('auto_comment_api_url') or '').strip()
+            if not comment_api_url:
+                logger.warning(f"【{self.cookie_id}】未配置 auto_comment_api_url，跳过自动好评接口调用")
+                return {
+                    "success": False,
+                    "message": "未配置自动好评 API 地址，请在系统设置中填写后再启用此功能"
+                }
+
             # 获取当前账号的cookie
             cookie_str = self.cookies_str
             
@@ -6735,13 +6744,17 @@ class XianyuLive:
                 from utils.xianyu_slider_stealth import XianyuSliderStealth
                 logger.info(f"【{self.cookie_id}】XianyuSliderStealth导入成功，使用滑块验证")
 
+                # 读取账号配置以决定浏览器模式（默认无头）
+                account_info = db_manager.get_cookie_details(self.cookie_id) or {}
+                show_browser = bool(account_info.get('show_browser', False))
                 # 创建独立的滑块验证实例（每个用户独立实例，避免并发冲突）
                 slider_stealth = XianyuSliderStealth(
-                    # user_id=f"{self.cookie_id}_{int(time.time() * 1000)}",  # 使用唯一ID避免冲突
                     user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
                     enable_learning=True,  # 启用学习功能
-                    headless=True  # 使用有头模式（可视化浏览器）
+                    headless=not show_browser,
                 )
+                # 给当前滑块实例打上 token_refresh 场景标，让滑块层在硬拒绝时尽早交还给外层走账密恢复
+                slider_stealth.risk_trigger_scene = 'token_refresh'
 
                 # 直接使用异步方法执行滑块验证（避免 ThreadPoolExecutor 导致的 Playwright 初始化问题）
                 success, cookies = await slider_stealth.async_run(verification_url)
@@ -12848,9 +12861,11 @@ class XianyuLive:
                     '--use-mock-keychain'
                 ])
 
-            # 使用无头浏览器
+            # 读取账号配置以决定浏览器模式（默认无头）
+            account_info = db_manager.get_cookie_details(self.cookie_id) or {}
+            show_browser = bool(account_info.get('show_browser', False))
             browser = await playwright.chromium.launch(
-                headless=True,
+                headless=not show_browser,
                 args=browser_args
             )
 
@@ -13136,9 +13151,11 @@ class XianyuLive:
                     '--use-mock-keychain'
                 ])
 
-            # Cookie刷新模式使用无头浏览器
+            # Cookie刷新模式：读取账号配置以决定浏览器模式（默认无头）
+            account_info = db_manager.get_cookie_details(self.cookie_id) or {}
+            show_browser = bool(account_info.get('show_browser', False))
             browser = await playwright.chromium.launch(
-                headless=True,
+                headless=not show_browser,
                 args=browser_args
             )
 
@@ -14022,6 +14039,36 @@ class XianyuLive:
                 if self.active_message_tasks % 100 == 0 and self.active_message_tasks > 0:
                     logger.info(f"【{self.cookie_id}】当前活跃消息处理任务数: {self.active_message_tasks}")
 
+    def _unwrap_message_for_dedupe(self, message_data: dict) -> Optional[dict]:
+        """把同步包还原成内部消息结构，让 messageId / createTime 提取走统一路径。
+
+        - 如果 message_data 已是内部结构（包含 key '1'），原样返回
+        - 如果是 syncPushPackage 同步包，先 base64 + json 解第一条 data 段返回
+        - 其它情况返回 None，让调用方走兜底标识
+        """
+        if not isinstance(message_data, dict):
+            return None
+        if "1" in message_data:
+            return message_data
+
+        try:
+            if not self.is_sync_package(message_data):
+                return None
+            sync_entries = (
+                ((message_data.get("body") or {}).get("syncPushPackage") or {}).get("data") or []
+            )
+            if not sync_entries:
+                return None
+            payload = sync_entries[0].get("data")
+            if not payload:
+                return None
+            decoded = base64.b64decode(payload).decode("utf-8")
+            inner = json.loads(decoded)
+            return inner if isinstance(inner, dict) else None
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】解析同步包消息用于去重时失败: {self._safe_str(exc)}")
+            return None
+
     def _extract_message_id(self, message_data: dict) -> str:
         """
         从消息数据中提取消息ID，用于去重
@@ -14033,9 +14080,12 @@ class XianyuLive:
             消息ID字符串，如果无法提取则返回None
         """
         try:
+            # 同步包消息要先还原到内部结构，否则下面的 message['1']['10']['bizTag'] 路径取不到
+            normalized_message = self._unwrap_message_for_dedupe(message_data)
+
             # 尝试从 message['1']['10']['bizTag'] 中提取 messageId
-            if isinstance(message_data, dict) and "1" in message_data:
-                message_1 = message_data.get("1")
+            if isinstance(normalized_message, dict) and "1" in normalized_message:
+                message_1 = normalized_message.get("1")
                 if isinstance(message_1, dict) and "10" in message_1:
                     message_10 = message_1.get("10")
                     if isinstance(message_10, dict) and "bizTag" in message_10:
@@ -14087,10 +14137,12 @@ class XianyuLive:
         # 如果没有 messageId，使用备用标识（chat_id + send_message + 时间戳）
         if not message_id:
             try:
+                # 同步包消息要先还原到内部结构再取 createTime
+                normalized_message = self._unwrap_message_for_dedupe(message_data) or {}
                 # 尝试从消息数据中提取时间戳
                 create_time = 0
-                if isinstance(message_data, dict) and "1" in message_data:
-                    message_1 = message_data.get("1")
+                if isinstance(normalized_message, dict) and "1" in normalized_message:
+                    message_1 = normalized_message.get("1")
                     if isinstance(message_1, dict):
                         create_time = message_1.get("5", 0)
                 # 使用组合键作为备用标识

@@ -935,6 +935,9 @@ Cookie数量: {cookie_count}
             ('smtp_from', '', '发件人显示名（留空则使用邮箱地址）'),
             ('smtp_use_tls', 'true', '是否启用TLS'),
             ('smtp_use_ssl', 'false', '是否启用SSL'),
+            ('verification_email_api_url', '', '验证码邮件 API 地址（留空则仅使用 SMTP，不再向旧硬编码地址外发）'),
+            ('qq_notification_api_url', '', 'QQ 私信通知 API 地址（留空则禁用 QQ 私信通知）'),
+            ('auto_comment_api_url', '', '自动好评辅助 API 地址（留空则禁用此功能，避免 Cookie 外发）'),
             ('qq_reply_secret_key', 'xianyu_qq_reply_2024', 'QQ回复消息API秘钥')
             ''')
 
@@ -4353,8 +4356,11 @@ Cookie数量: {cookie_count}
         try:
             import aiohttp
 
-            # 使用GET请求发送邮件
-            api_url = "https://dy.zhinianboke.com/api/emailSend"
+            # 邮件 API 地址：从系统设置读取，未配置则拒绝调用以避免向未知第三方泄露
+            api_url = (self.get_system_setting('verification_email_api_url') or '').strip()
+            if not api_url:
+                logger.warning(f"未配置 verification_email_api_url，无法通过 API 渠道发送验证码邮件: {email}")
+                return False
             params = {
                 'subject': subject,
                 'receiveUser': email,

@@ -1007,6 +1007,34 @@ class XianyuSliderStealth:
             return f"滑块验证失败：{feedback_message}"
         return default_message
 
+    def _should_abort_token_refresh_slider_flow_after_failure(self) -> Tuple[bool, str]:
+        """识别 token_refresh 场景下处罚壳子的 hard reject，让外层尽快走账密恢复。
+
+        三个条件必须同时满足才判为 hard reject：
+          1. 当前 risk_trigger_scene == 'token_refresh'（XianyuLive 创建滑块时打的标）
+          2. 上一轮 verification_feedback 文案里含 '验证失败，点击框体重试'
+          3. 反馈里附带 fail_code，或正文里能看到 'error:xxxx' 形式的错误码
+        命中后返回 (True, 原因)；否则 (False, "")。
+        """
+        if getattr(self, "risk_trigger_scene", None) != "token_refresh":
+            return False, ""
+
+        feedback = self.last_verification_feedback or {}
+        fail_code = str(feedback.get("fail_code") or "").strip().lower()
+        message_pieces = (
+            str(feedback.get("message") or "").strip(),
+            str(feedback.get("dom_error_text") or "").strip(),
+        )
+        joined_message = " ".join(piece for piece in message_pieces if piece)
+
+        has_retry_prompt = "验证失败，点击框体重试" in joined_message
+        has_error_code = bool(fail_code) or "error:" in joined_message.lower()
+        if not (has_retry_prompt and has_error_code):
+            return False, ""
+
+        code_label = fail_code or "unknown"
+        return True, f"token_refresh 场景命中处罚壳 hard reject({code_label})，提前结束滑块重试"
+
     def _capture_verification_screenshot(self, page, frame=None, iframe_selector: Optional[str] = None) -> Optional[str]:
         """截取验证页面截图，多种方式逐级回退"""
         try:
@@ -2656,9 +2684,15 @@ class XianyuSliderStealth:
             logger.error(f"【{self.pure_user_id}】删除截图时出错: {e}")
 
     def _wait_for_context_login(self, context, fallback_page, max_wait_time: int = 450, check_interval: int = 10,
-                                allow_active_slider_retry: bool = True) -> Tuple[bool, Any]:
+                                allow_active_slider_retry: bool = True,
+                                verification_type: str = 'unknown',
+                                verification_url: Optional[str] = None,
+                                notification_callback: Optional[Callable] = None,
+                                notification_scene: str = '账号密码登录') -> Tuple[bool, Any]:
         waited_time = 0
         monitor_page = fallback_page
+        last_verification_type = verification_type or 'unknown'
+        last_verification_url = verification_url or None
 
         while waited_time < max_wait_time:
             monitor_page = self._select_monitor_page(context, monitor_page)
@@ -2668,6 +2702,34 @@ class XianyuSliderStealth:
             login_success, success_page, _ = self._probe_context_login_success(context, monitor_page)
             if login_success:
                 return True, success_page or monitor_page
+
+            # 等待期间持续探测验证页：类型或 URL 变化时刷新通知，避免前端展示过期截图
+            try:
+                has_verification, refreshed_frame = self._detect_qr_code_verification(monitor_page)
+                if has_verification and refreshed_frame is not None:
+                    refreshed_type = getattr(refreshed_frame, 'verification_type', None) or 'unknown'
+                    refreshed_url = (
+                        getattr(refreshed_frame, 'verify_url', None)
+                        or getattr(refreshed_frame, 'url', None)
+                    )
+                    if (refreshed_type != last_verification_type
+                            or (refreshed_url or None) != last_verification_url):
+                        refreshed_screenshot = getattr(refreshed_frame, 'screenshot_path', None)
+                        logger.info(
+                            f"【{self.pure_user_id}】等待期间验证页发生变化: "
+                            f"{last_verification_type}->{refreshed_type}, url={refreshed_url or 'N/A'}; 推送新通知"
+                        )
+                        self._notify_verification_required(
+                            refreshed_type,
+                            refreshed_url,
+                            refreshed_screenshot,
+                            notification_callback,
+                            notification_scene,
+                        )
+                        last_verification_type = refreshed_type
+                        last_verification_url = refreshed_url or None
+            except Exception as detect_err:
+                logger.debug(f"【{self.pure_user_id}】等待期间重新探测验证页失败: {detect_err}")
 
             time.sleep(check_interval)
             waited_time += check_interval
@@ -2833,6 +2895,10 @@ class XianyuSliderStealth:
                 max_wait_time=450,
                 check_interval=10,
                 allow_active_slider_retry=False,
+                verification_type=verification_type,
+                verification_url=frame_url,
+                notification_callback=notification_callback,
+                notification_scene=notification_scene,
             )
         finally:
             self._cleanup_verification_screenshots()
@@ -5469,7 +5535,13 @@ class XianyuSliderStealth:
                         failure_info = self._analyze_failure(attempt, slide_distance, self.current_trajectory_data)
                         failure_records.append(failure_info)
                         self._save_failure_record(self.current_trajectory_data, failure_info)
-                    
+
+                    # token_refresh 场景下若已是处罚壳硬拒绝，立即停止后续重试，把控制权交还外层
+                    abort_now, abort_reason = self._should_abort_token_refresh_slider_flow_after_failure()
+                    if abort_now:
+                        logger.warning(f"【{self.pure_user_id}】{abort_reason}")
+                        break
+
                     # 如果不是最后一次尝试，继续
                     if attempt < max_retries:
                         continue
